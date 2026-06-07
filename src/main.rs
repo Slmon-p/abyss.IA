@@ -20,33 +20,35 @@ use std::time::Duration;
 // ---- Configuração padrão (pode ser trocada na UI, em ⚙ Configurações) ----
 const DEFAULT_API_KEY: &str = "AQ.Ab8RN6KsIezTPxmcZCPV2ebOHVEaIxsM-DpmzQw_obsIeL4NSg";
 const DEFAULT_MODEL: &str = "gemini-2.5-flash";
-const MAX_AGENT_STEPS: usize = 8;
+const MAX_AGENT_STEPS: usize = 16;
 
 const CHAT_SYSTEM: &str = "Você é um assistente útil e direto. \
 Responda sempre no idioma do usuário (português quando ele escrever em português). \
 Seja claro, objetivo e formate quando ajudar a leitura.";
 
-const AGENT_SYSTEM: &str = r#"Você é um AGENTE DE AUTOMAÇÃO LOCAL rodando na máquina Windows do usuário, com acesso TOTAL ao PowerShell.
-O usuário descreve uma tarefa em linguagem natural. Sua função é REALIZÁ-LA, passo a passo, emitindo comandos PowerShell reais.
+const AGENT_SYSTEM: &str = r#"Você é um AGENTE DEV/AUTOMAÇÃO rodando na máquina Windows do usuário.
+Você trabalha DENTRO de uma PASTA DE TRABALHO (informada abaixo) e pode:
+- ler arquivos (para entender antes de editar),
+- criar/editar QUALQUER tipo de arquivo de texto (código, config, .md, .json, .html, etc.),
+- executar comandos PowerShell (executados a partir da pasta de trabalho).
 
-Para CADA passo responda SOMENTE com um objeto JSON com os campos:
-- "explanation": em português, 1-2 frases, o que você fará neste passo (ou o resumo final).
-- "powershell":  UM comando/script PowerShell para executar o passo. String vazia "" se nenhum comando for necessário.
-- "task_complete": true quando a tarefa inteira estiver concluída e nenhum comando adicional for necessário; senão false.
+Para CADA passo responda SOMENTE com um objeto JSON:
+- "explanation": em português, 1-2 frases, o que fará neste passo (ou o resumo final).
+- "action": "read_file" | "write_file" | "run" | "finish".
+- "path": caminho RELATIVO à pasta de trabalho (para read_file e write_file).
+- "content": o conteúdo COMPLETO e final do arquivo (apenas para write_file; sobrescreve o arquivo inteiro — NÃO use diffs/trechos).
+- "powershell": o comando (apenas para action="run").
+- "task_complete": true quando a tarefa inteira terminou.
 
-Depois de cada comando você receberá a saída (stdout/stderr) e poderá decidir o próximo passo com base nela.
+Depois de cada passo você recebe o resultado (saída do comando, conteúdo do arquivo, ou confirmação de escrita) e decide o próximo.
 
 Regras:
-- Comandos NÃO interativos (nunca peça confirmação; use -Force quando fizer sentido).
-- Abrir programas:  Start-Process  (ex.: Start-Process notepad ; Start-Process calc ; Start-Process msedge "https://google.com").
-- Criar pastas/arquivos:  New-Item -ItemType Directory -Force ... / New-Item -ItemType File ...
-- Área de trabalho:  use  [Environment]::GetFolderPath('Desktop')  para o caminho correto.
-- Planilhas Excel via COM (ex.):
-    $x = New-Object -ComObject Excel.Application; $x.Visible = $true; $wb = $x.Workbooks.Add(); $ws = $wb.Worksheets.Item(1); $ws.Cells.Item(1,1) = 'Olá'; $wb.SaveAs((Join-Path ([Environment]::GetFolderPath('Desktop')) 'teste.xlsx'))
-- Digitar/automatizar teclado:  Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('texto')
-- Se for só conversa/saudação (ex.: "olá"), responda na "explanation", deixe "powershell" vazio e "task_complete"=true.
-- Faça um passo objetivo por vez. Não invente caminhos; descubra com comandos quando precisar.
-- Ao terminar, escreva um resumo curto na "explanation", "powershell"="" e "task_complete"=true."#;
+- Para EDITAR um arquivo: faça read_file antes, depois write_file com o conteúdo completo já alterado.
+- Para CRIAR arquivo novo: write_file direto com o conteúdo.
+- Comandos PowerShell NÃO interativos. Abrir programas: Start-Process (ex.: Start-Process notepad).
+- Faça UM passo objetivo por vez. Não invente caminhos; use read_file ou "run" (ex.: Get-ChildItem) para descobrir.
+- Se for só conversa/saudação ("olá"), use action="finish" e task_complete=true.
+- Ao terminar, action="finish", path/content/powershell vazios, task_complete=true, e um resumo na "explanation"."#;
 
 // ----------------------------- Modelo de dados da UI -----------------------------
 
@@ -91,6 +93,7 @@ enum WorkerMsg {
     AgentOut(String),
     AgentErr(String),
     AgentDone(Vec<(String, String)>),
+    WorkDir(String),
 }
 
 #[derive(Clone)]
@@ -113,6 +116,8 @@ struct App {
     memory: Vec<MemoryEntry>,
     mem_path: std::path::PathBuf,
     next_mem_id: u64,
+    work_dir: String,
+    project_root: std::path::PathBuf,
     tx: mpsc::Sender<WorkerMsg>,
     rx: mpsc::Receiver<WorkerMsg>,
     http: ureq::Agent,
@@ -131,6 +136,8 @@ impl App {
         let mem_path = memory_path();
         let memory = load_memory(&mem_path);
         let next_mem_id = memory.iter().map(|m| m.id).max().unwrap_or(0);
+        let project_root = find_project_root();
+        let work_dir = project_root.to_string_lossy().to_string();
         Self {
             mode: Mode::Chat,
             input: String::new(),
@@ -144,6 +151,8 @@ impl App {
             memory,
             mem_path,
             next_mem_id,
+            work_dir,
+            project_root,
             tx,
             rx,
             http,
@@ -240,14 +249,54 @@ impl App {
                 spawn_chat(ctx2, tx, http, key, model, system, history);
             }
             Mode::Agent => {
-                let system = format!("{AGENT_SYSTEM}{}", self.memory_preamble());
+                let work_dir = std::path::PathBuf::from(self.work_dir.trim());
+                let system = format!(
+                    "{AGENT_SYSTEM}\n\nPASTA DE TRABALHO: {}\n{}",
+                    work_dir.display(),
+                    self.memory_preamble()
+                );
                 self.agent.transcript.push(Msg::new(Role::User, text.clone()));
                 self.agent.history.push(("user".into(), text));
                 let history = self.agent.history.clone();
                 let auto = self.auto_run;
-                spawn_agent(ctx2, tx, http, key, model, system, history, auto);
+                spawn_agent(ctx2, tx, http, key, model, system, history, work_dir, auto);
             }
         }
+    }
+
+    fn start_self_update(&mut self, ctx: &egui::Context) {
+        if self.pending {
+            return;
+        }
+        let instruction = self.input.trim().to_string();
+        if instruction.is_empty() {
+            self.agent.transcript.push(Msg::new(
+                Role::Error,
+                "Escreva no campo o que você quer mudar no Abyss e então clique em 🔄 Auto-update.",
+            ));
+            return;
+        }
+        if self.api_key.trim().is_empty() {
+            self.agent
+                .transcript
+                .push(Msg::new(Role::Error, "Configure sua API Key em ⚙ Configurações."));
+            return;
+        }
+        self.input.clear();
+        self.agent
+            .transcript
+            .push(Msg::new(Role::User, format!("🔄 Auto-update: {instruction}")));
+        self.pending = true;
+        spawn_self_update(
+            ctx.clone(),
+            self.tx.clone(),
+            self.http.clone(),
+            self.api_key.trim().to_string(),
+            self.model.trim().to_string(),
+            self.memory_preamble(),
+            instruction,
+            self.project_root.clone(),
+        );
     }
 
     fn drain(&mut self) {
@@ -265,14 +314,12 @@ impl App {
                 WorkerMsg::AgentSay(t) => self.agent.transcript.push(Msg::new(Role::Model, t)),
                 WorkerMsg::AgentCmd(c) => self.agent.transcript.push(Msg::new(Role::Cmd, c)),
                 WorkerMsg::AgentOut(o) => self.agent.transcript.push(Msg::new(Role::Output, o)),
-                WorkerMsg::AgentErr(e) => {
-                    self.agent.transcript.push(Msg::new(Role::Error, e));
-                    self.pending = false;
-                }
+                WorkerMsg::AgentErr(e) => self.agent.transcript.push(Msg::new(Role::Error, e)),
                 WorkerMsg::AgentDone(h) => {
                     self.agent.history = h;
                     self.pending = false;
                 }
+                WorkerMsg::WorkDir(p) => self.work_dir = p,
             }
         }
     }
@@ -306,12 +353,33 @@ impl eframe::App for App {
 
             if self.mode == Mode::Agent {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.auto_run, "Executar comandos automaticamente");
+                    ui.checkbox(&mut self.auto_run, "Executar automaticamente");
                     ui.label(
-                        egui::RichText::new("⚠ o agente roda comandos REAIS no seu PC")
+                        egui::RichText::new("⚠ roda comandos/edições REAIS")
                             .small()
                             .color(egui::Color32::from_rgb(220, 160, 60)),
                     );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Pasta:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.work_dir)
+                            .desired_width(330.0)
+                            .hint_text("pasta onde o agente trabalha"),
+                    );
+                    if ui.button("📁").on_hover_text("Escolher pasta").clicked() {
+                        spawn_folder_picker(ctx.clone(), self.tx.clone(), self.work_dir.clone());
+                    }
+                    if ui
+                        .add_enabled(!self.pending, egui::Button::new("🔄 Auto-update Abyss"))
+                        .on_hover_text(
+                            "Salva no Git, edita uma cópia (updateabyss), compila e promove se passar.\n\
+                             Escreva no campo de baixo O QUE mudar e clique aqui.",
+                        )
+                        .clicked()
+                    {
+                        self.start_self_update(ctx);
+                    }
                 });
             }
 
@@ -633,20 +701,174 @@ fn detect_memory_command(text: &str) -> Option<String> {
     }
 }
 
-fn run_powershell(script: &str) -> String {
-    let wrapped = format!(
-        "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script}"
-    );
+// ----------------------------- Sistema de arquivos / projeto -----------------------------
+
+/// Junta `rel` a `base` com segurança (não permite caminho absoluto nem subir de pasta).
+fn safe_join(base: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    let rel = rel.trim().replace('\\', "/");
+    if rel.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(&rel);
+    if p.is_absolute() {
+        return None;
+    }
+    let mut out = base.to_path_buf();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::Normal(c) => out.push(c),
+            std::path::Component::CurDir => {}
+            _ => return None, // ParentDir, RootDir, Prefix: bloqueados
+        }
+    }
+    Some(out)
+}
+
+fn write_file_in(base: &std::path::Path, rel: &str, content: &str) -> String {
+    let path = match safe_join(base, rel) {
+        Some(p) => p,
+        None => return format!("ERRO: caminho inválido/não permitido: {rel}"),
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return format!("ERRO ao criar pasta de {rel}: {e}");
+        }
+    }
+    match std::fs::write(&path, content) {
+        Ok(_) => format!("OK: {} bytes gravados em {rel}", content.len()),
+        Err(e) => format!("ERRO ao gravar {rel}: {e}"),
+    }
+}
+
+fn read_file_in(base: &std::path::Path, rel: &str) -> String {
+    match safe_join(base, rel) {
+        Some(p) => match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            Err(e) => format!("ERRO ao ler {rel}: {e}"),
+        },
+        None => format!("ERRO: caminho inválido: {rel}"),
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncado)", &s[..end])
+}
+
+const SKIP_NAMES: &[&str] = &[".git", "target", "updateabyss", "abyss_memory.json"];
+
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if SKIP_NAMES.contains(&name.to_string_lossy().as_ref()) {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        if from.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            if let Some(p) = to.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn promote_tree(src: &std::path::Path, dst: &std::path::Path, count: &mut usize) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if SKIP_NAMES.contains(&name.to_string_lossy().as_ref()) {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        if from.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            promote_tree(&from, &to, count)?;
+        } else {
+            if let Some(p) = to.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::copy(&from, &to)?;
+            *count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// `cargo build` (debug) dentro de `dir`. Retorna (compilou, log).
+fn build_dir(dir: &std::path::Path) -> (bool, String) {
     let out = std::process::Command::new("powershell")
+        .current_dir(dir)
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            &wrapped,
+            "$env:Path = \"$env:USERPROFILE\\.cargo\\bin;C:\\msys64\\mingw64\\bin;$env:Path\"; cargo build 2>&1 | Out-String; exit $LASTEXITCODE",
         ])
         .output();
+    match out {
+        Ok(o) => {
+            let mut log = String::from_utf8_lossy(&o.stdout).to_string();
+            let se = String::from_utf8_lossy(&o.stderr);
+            if !se.trim().is_empty() {
+                log.push_str(&se);
+            }
+            (o.status.success(), log)
+        }
+        Err(e) => (false, format!("Falha ao iniciar cargo: {e}")),
+    }
+}
+
+fn find_project_root() -> std::path::PathBuf {
+    let start = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut d = start.clone();
+    loop {
+        if d.join("Cargo.toml").exists() {
+            return d;
+        }
+        match d.parent() {
+            Some(p) => d = p.to_path_buf(),
+            None => return std::env::current_dir().unwrap_or(start),
+        }
+    }
+}
+
+fn run_powershell(script: &str, work_dir: &std::path::Path) -> String {
+    let wrapped = format!(
+        "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script}"
+    );
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &wrapped,
+    ]);
+    if work_dir.is_dir() {
+        cmd.current_dir(work_dir);
+    }
+    let out = cmd.output();
     match out {
         Ok(o) => {
             let so = String::from_utf8_lossy(&o.stdout);
@@ -700,6 +922,123 @@ fn spawn_chat(
     });
 }
 
+/// Núcleo do agente: loop de passos (read_file / write_file / run) na pasta de trabalho.
+/// Devolve true se terminou normalmente; false se houve erro de API (já reportado).
+#[allow(clippy::too_many_arguments)]
+fn run_agent_loop(
+    ctx: &egui::Context,
+    tx: &mpsc::Sender<WorkerMsg>,
+    http: &ureq::Agent,
+    key: &str,
+    model: &str,
+    system: &str,
+    history: &mut Vec<(String, String)>,
+    work_dir: &std::path::Path,
+    auto_run: bool,
+    max_steps: usize,
+) -> bool {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "explanation": { "type": "string" },
+            "action": { "type": "string", "enum": ["run", "write_file", "read_file", "finish"] },
+            "path": { "type": "string" },
+            "content": { "type": "string" },
+            "powershell": { "type": "string" },
+            "task_complete": { "type": "boolean" }
+        },
+        "required": ["explanation", "action", "task_complete"]
+    });
+
+    for _ in 0..max_steps {
+        let body = json!({
+            "contents": contents_from(history),
+            "systemInstruction": { "parts": [{ "text": system }] },
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+                "responseSchema": schema
+            }
+        });
+
+        let v = match call_gemini(http, key, model, body) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::AgentErr(e));
+                ctx.request_repaint();
+                return false;
+            }
+        };
+        let raw = match extract_text(&v) {
+            Some(t) => t,
+            None => {
+                let _ = tx.send(WorkerMsg::AgentErr(format!("Sem resposta utilizável: {v}")));
+                ctx.request_repaint();
+                return false;
+            }
+        };
+        history.push(("model".into(), raw.clone()));
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|_| json!({ "explanation": raw, "action": "finish", "task_complete": true }));
+        let expl = parsed.get("explanation").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let action = parsed.get("action").and_then(|x| x.as_str()).unwrap_or("finish").to_string();
+        let path = parsed.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let content = parsed.get("content").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let ps = parsed.get("powershell").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let done = parsed.get("task_complete").and_then(|x| x.as_bool()).unwrap_or(false);
+
+        if !expl.trim().is_empty() {
+            let _ = tx.send(WorkerMsg::AgentSay(expl));
+            ctx.request_repaint();
+        }
+
+        let mut acted = false;
+        match action.as_str() {
+            "write_file" if !path.trim().is_empty() => {
+                acted = true;
+                let _ = tx.send(WorkerMsg::AgentCmd(format!("✏ write_file  {path}  ({} bytes)", content.len())));
+                ctx.request_repaint();
+                let result = write_file_in(work_dir, &path, &content);
+                let _ = tx.send(WorkerMsg::AgentOut(result.clone()));
+                ctx.request_repaint();
+                history.push(("user".into(), format!("Resultado de write_file {path}: {result}. Próximo passo ou finalize.")));
+            }
+            "read_file" if !path.trim().is_empty() => {
+                acted = true;
+                let _ = tx.send(WorkerMsg::AgentCmd(format!("📖 read_file  {path}")));
+                ctx.request_repaint();
+                let data = read_file_in(work_dir, &path);
+                let _ = tx.send(WorkerMsg::AgentOut(truncate_str(&data, 3000)));
+                ctx.request_repaint();
+                history.push(("user".into(), format!("Conteúdo de {path}:\n{}", truncate_str(&data, 16000))));
+            }
+            "run" if !ps.trim().is_empty() => {
+                acted = true;
+                let _ = tx.send(WorkerMsg::AgentCmd(format!("▶ {ps}")));
+                ctx.request_repaint();
+                if !auto_run {
+                    let _ = tx.send(WorkerMsg::AgentOut(
+                        "⏸ Execução automática DESLIGADA — comando não executado.".into(),
+                    ));
+                    ctx.request_repaint();
+                    return true;
+                }
+                let output = run_powershell(&ps, work_dir);
+                let _ = tx.send(WorkerMsg::AgentOut(output.clone()));
+                ctx.request_repaint();
+                history.push(("user".into(), format!("Saída do comando:\n{output}\n\nPróximo passo ou finalize.")));
+            }
+            _ => {}
+        }
+
+        if !acted || done {
+            break;
+        }
+    }
+    true
+}
+
 fn spawn_agent(
     ctx: egui::Context,
     tx: mpsc::Sender<WorkerMsg>,
@@ -708,94 +1047,147 @@ fn spawn_agent(
     model: String,
     system: String,
     mut history: Vec<(String, String)>,
+    work_dir: std::path::PathBuf,
     auto_run: bool,
 ) {
     thread::spawn(move || {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "explanation": { "type": "string" },
-                "powershell": { "type": "string" },
-                "task_complete": { "type": "boolean" }
-            },
-            "required": ["explanation", "powershell", "task_complete"]
-        });
+        run_agent_loop(
+            &ctx, &tx, &http, &key, &model, &system, &mut history, &work_dir, auto_run, MAX_AGENT_STEPS,
+        );
+        let _ = tx.send(WorkerMsg::AgentDone(history));
+        ctx.request_repaint();
+    });
+}
 
-        for _ in 0..MAX_AGENT_STEPS {
-            let body = json!({
-                "contents": contents_from(&history),
-                "systemInstruction": { "parts": [{ "text": system.as_str() }] },
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "responseMimeType": "application/json",
-                    "responseSchema": schema
-                }
-            });
-
-            let v = match call_gemini(&http, &key, &model, body) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx.send(WorkerMsg::AgentErr(e));
-                    ctx.request_repaint();
-                    return;
-                }
-            };
-            let raw = match extract_text(&v) {
-                Some(t) => t,
-                None => {
-                    let _ = tx.send(WorkerMsg::AgentErr(format!("Sem resposta utilizável: {v}")));
-                    ctx.request_repaint();
-                    return;
-                }
-            };
-
-            history.push(("model".into(), raw.clone()));
-
-            let parsed: serde_json::Value = serde_json::from_str(&raw)
-                .unwrap_or_else(|_| json!({ "explanation": raw, "powershell": "", "task_complete": true }));
-            let expl = parsed.get("explanation").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let ps = parsed.get("powershell").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let done = parsed.get("task_complete").and_then(|x| x.as_bool()).unwrap_or(true);
-
-            if !expl.trim().is_empty() {
-                let _ = tx.send(WorkerMsg::AgentSay(expl));
-                ctx.request_repaint();
-            }
-
-            if ps.trim().is_empty() {
-                break; // sem comando = resposta final
-            }
-
-            let _ = tx.send(WorkerMsg::AgentCmd(ps.clone()));
+/// Auto-edição do próprio Abyss: push → cópia `updateabyss` → o agente edita →
+/// `cargo build` → promove se compilar; se não, mantém a cópia para iterar depois.
+fn spawn_self_update(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerMsg>,
+    http: ureq::Agent,
+    key: String,
+    model: String,
+    memory_block: String,
+    instruction: String,
+    project_root: std::path::PathBuf,
+) {
+    thread::spawn(move || {
+        let say = |s: String| {
+            let _ = tx.send(WorkerMsg::AgentSay(s));
             ctx.request_repaint();
-
-            if !auto_run {
-                let _ = tx.send(WorkerMsg::AgentOut(
-                    "⏸ Execução automática DESLIGADA — comando não foi executado.".into(),
-                ));
-                ctx.request_repaint();
-                break;
-            }
-
-            let output = run_powershell(&ps);
-            let _ = tx.send(WorkerMsg::AgentOut(output.clone()));
+        };
+        let out = |s: String| {
+            let _ = tx.send(WorkerMsg::AgentOut(s));
             ctx.request_repaint();
+        };
+        let err = |s: String| {
+            let _ = tx.send(WorkerMsg::AgentErr(s));
+            ctx.request_repaint();
+        };
 
-            history.push((
-                "user".into(),
+        let update_dir = project_root.join("updateabyss");
+        let resuming = update_dir.exists();
+
+        let seed = if resuming {
+            // Já existe uma cópia — continua iterando nela (mantém mudanças e o cache de build).
+            say("📂 'updateabyss' já existe — retomando a iteração nela (build incremental).".into());
+            let (ok0, log0) = build_dir(&update_dir);
+            if ok0 {
                 format!(
-                    "Saída do comando anterior:\n{output}\n\nSe a tarefa foi concluída, defina \
-                     task_complete=true e powershell vazio. Caso contrário, forneça o próximo passo."
-                ),
-            ));
-
-            if done {
-                break;
+                    "A cópia já compila. Aplique o pedido a seguir mantendo o projeto compilável. Pedido: {instruction}"
+                )
+            } else {
+                format!(
+                    "A cópia ainda NÃO compila. Corrija os ERROS de compilação abaixo e também atenda ao pedido.\n\
+                     Pedido: {instruction}\n\nERROS:\n{}",
+                    truncate_str(&log0, 6000)
+                )
             }
+        } else {
+            // Primeira vez: salva no Git e cria a cópia.
+            say("🔄 Auto-update: enviando o projeto atual ao GitHub…".into());
+            let push = run_powershell(
+                "git add -A; git commit -m \"snapshot antes do auto-update\" 2>&1 | Out-String; git push origin main 2>&1 | Out-String",
+                &project_root,
+            );
+            out(truncate_str(&push, 2000));
+
+            say(format!("📁 Criando a cópia de trabalho: {}", update_dir.display()));
+            if let Err(e) = copy_tree(&project_root, &update_dir) {
+                err(format!("Falha ao copiar o projeto: {e}"));
+                let _ = tx.send(WorkerMsg::AgentDone(vec![]));
+                ctx.request_repaint();
+                return;
+            }
+            format!(
+                "Você está editando uma CÓPIA do projeto Abyss (app Rust/egui em src/main.rs). \
+                 Faça a alteração pedida editando os arquivos necessários (use read_file e write_file com o conteúdo COMPLETO). \
+                 NÃO rode 'cargo build' — eu compilo depois. Pedido do usuário: {instruction}"
+            )
+        };
+
+        say("✍ O agente vai editar os arquivos na cópia…".into());
+        let system = format!(
+            "{AGENT_SYSTEM}\n\nPASTA DE TRABALHO: {}\n{}",
+            update_dir.display(),
+            memory_block
+        );
+        let mut history: Vec<(String, String)> = vec![("user".to_string(), seed)];
+        let ok_loop = run_agent_loop(
+            &ctx, &tx, &http, &key, &model, &system, &mut history, &update_dir, true, 24,
+        );
+        if !ok_loop {
+            say("Interrompido por erro de API. A pasta 'updateabyss' foi mantida para retomar depois.".into());
+            let _ = tx.send(WorkerMsg::AgentDone(history));
+            ctx.request_repaint();
+            return;
+        }
+
+        say("🛠 Compilando a cópia (cargo build)… na 1ª vez pode levar alguns minutos.".into());
+        let (built, log) = build_dir(&update_dir);
+        out(truncate_str(&log, 6000));
+
+        if built {
+            let mut count = 0usize;
+            match promote_tree(&update_dir, &project_root, &mut count) {
+                Ok(()) => say(format!(
+                    "✅ Compilou! Promovi {count} arquivo(s) para o projeto principal. \
+                     Feche o Abyss e rode run.bat para compilar/usar a nova versão. (A pasta 'updateabyss' foi mantida.)"
+                )),
+                Err(e) => err(format!("Compilou, mas falhou ao promover: {e}")),
+            }
+        } else {
+            err(
+                "❌ A cópia NÃO compilou — não promovi nada e MANTIVE a pasta 'updateabyss'. \
+                 Clique de novo em 🔄 Auto-update (ou peça 'corrija os erros') que eu continuo iterando nela até compilar."
+                    .into(),
+            );
         }
 
         let _ = tx.send(WorkerMsg::AgentDone(history));
         ctx.request_repaint();
+    });
+}
+
+fn spawn_folder_picker(ctx: egui::Context, tx: mpsc::Sender<WorkerMsg>, start: String) {
+    thread::spawn(move || {
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $f = New-Object System.Windows.Forms.FolderBrowserDialog; \
+             try {{ $f.SelectedPath = '{}' }} catch {{}}; \
+             if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Out.Write($f.SelectedPath) }}",
+            start.replace('\'', "''")
+        );
+        if let Ok(o) = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-STA", "-Command", &script])
+            .output()
+        {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !p.is_empty() {
+                let _ = tx.send(WorkerMsg::WorkDir(p));
+                ctx.request_repaint();
+            }
+        }
     });
 }
 
@@ -829,10 +1221,36 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_memory_command;
+    use super::{detect_memory_command, safe_join, truncate_str};
+    use std::path::Path;
 
     fn d(s: &str) -> Option<String> {
         detect_memory_command(s)
+    }
+
+    #[test]
+    fn safe_join_aceita_relativo() {
+        let base = Path::new("C:/proj");
+        assert_eq!(safe_join(base, "src/main.rs"), Some(Path::new("C:/proj/src/main.rs").to_path_buf()));
+        assert_eq!(safe_join(base, "Cargo.toml"), Some(Path::new("C:/proj/Cargo.toml").to_path_buf()));
+    }
+
+    #[test]
+    fn safe_join_bloqueia_escape_e_absoluto() {
+        let base = Path::new("C:/proj");
+        assert_eq!(safe_join(base, "../segredo.txt"), None);
+        assert_eq!(safe_join(base, "a/../../b"), None);
+        assert_eq!(safe_join(base, "C:/Windows/system32"), None);
+        assert_eq!(safe_join(base, ""), None);
+    }
+
+    #[test]
+    fn truncate_respeita_limite() {
+        assert_eq!(truncate_str("abc", 10), "abc");
+        assert!(truncate_str("abcdefghij", 5).starts_with("abcde"));
+        // não deve quebrar em caractere multibyte
+        let s = "áéíóú".repeat(3);
+        let _ = truncate_str(&s, 5); // não pode panicar
     }
 
     #[test]

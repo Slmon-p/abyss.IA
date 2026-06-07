@@ -2,3 +2,4 @@
 **/*.rs.bk
 assets/_*.png
 abyss_memory.json
+/updateabyss

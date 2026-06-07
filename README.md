@@ -164,3 +164,39 @@ O Abyss lembra de fatos e instruções suas entre sessões.
   na `systemInstruction` enviada ao Gemini — então ele realmente lembra e respeita.
 - **Gerenciar:** em **⚙ Configurações** há a seção **🧠 Memória (N)** para ver cada item,
   remover com **✕** ou **Limpar tudo**.
+
+---
+
+## 7. Agente Dev: pasta de trabalho, edição de arquivos e auto-edição
+
+No modo **🤖 Agente Local** o agente agora é um agente de desenvolvimento.
+
+### Pasta de trabalho
+- Campo **Pasta:** define onde o agente atua. Botão **📁** abre o seletor de pastas do Windows.
+- Tudo que o agente lê/escreve/executa acontece **dentro dessa pasta** (caminhos relativos;
+  ele não consegue subir de pasta nem usar caminhos absolutos — proteção `safe_join`).
+
+### Edição de qualquer arquivo
+A cada passo o Gemini responde em JSON com uma **ação**:
+- `read_file` (path) — lê um arquivo para entender antes de editar;
+- `write_file` (path + content) — cria/sobrescreve **qualquer** arquivo de texto com o conteúdo completo;
+- `run` (powershell) — executa um comando na pasta de trabalho;
+- `finish` — encerra com um resumo.
+
+O app executa a ação, devolve o resultado ao modelo e ele decide o próximo passo (até 16 passos).
+Ex.: *"crie um index.html simples com um título Olá"*, *"abra o main.py e troque a porta 8000 por 9000"*.
+
+### 🔄 Auto-update Abyss (o agente edita o próprio código com segurança)
+Escreva no campo **o que** mudar no Abyss e clique em **🔄 Auto-update Abyss**. O fluxo:
+1. **Salva no Git** o projeto atual (`git add/commit/push`).
+2. **Copia** o projeto para `updateabyss/` (ignorando `.git`, `target`, `abyss_memory.json`).
+3. O **agente edita** os arquivos **dentro da cópia** (read_file/write_file).
+4. Roda **`cargo build`** na cópia.
+5. Se **compilar** → **promove** os arquivos novos para o projeto principal e mantém a cópia.
+   Depois é só **fechar o Abyss e rodar `run.bat`** para usar a versão nova.
+6. Se **não compilar** → **não promove nada** e **mantém `updateabyss/`**. Clique de novo em
+   🔄 (ou peça *"corrija os erros"*): como a cópia já existe, ele **retoma** dela, lê os erros do
+   `cargo build` e continua iterando **até compilar** (build incremental, bem mais rápido).
+
+> Ou seja: ele nunca te entrega código que não roda — no máximo continua ajustando. A cópia
+> `updateabyss/` é mantida para você pedir mais ajustes; ela é ignorada pelo Git.
