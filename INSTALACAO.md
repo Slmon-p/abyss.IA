@@ -92,13 +92,18 @@ Binário final: **`target\release\abyss.exe`**.
 
 ## D) Modelos do Gemini (grátis)
 
-Na barra superior há o seletor **Gemini:** com as versões de camada gratuita:
-`gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.0-flash`, `gemini-2.0-flash-lite`,
-`gemini-1.5-flash`, `gemini-1.5-flash-8b`. (Padrão: `gemini-2.5-flash`.)
+Na barra superior há o seletor **Gemini:**, dividido em dois grupos:
+
+- **Flash — rápidos, cota maior:** `gemini-2.5-flash` (padrão), `gemini-2.5-flash-lite`,
+  `gemini-2.0-flash`, `gemini-2.0-flash-lite`, `gemini-1.5-flash`, `gemini-1.5-flash-8b`.
+- **Pro — raciocínio profundo, cota baixa:** `gemini-2.5-pro`, `gemini-1.5-pro`.
+  São os modelos de raciocínio mais forte, mas a cota gratuita é bem menor
+  (historicamente ~50 requisições/dia no 1.5 Pro).
 
 > A camada gratuita tem **limite diário de requisições por modelo**. Cada passo do Agente é
-> 1 requisição, então tarefas/auto-update longos podem esgotar a cota — nesse caso troque de
-> modelo no seletor ou gere uma key com billing.
+> 1 requisição, então tarefas/auto-update longos esgotam a cota rápido — principalmente nos
+> **Pro**. Troque de modelo no seletor (ex.: use Flash para tarefas longas e Pro para raciocínio
+> pontual) ou gere uma key com billing.
 
 ---
 
