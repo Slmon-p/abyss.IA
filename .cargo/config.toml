@@ -1,0 +1,5 @@
+# Fixa o linker/ar do MinGW (MSYS2) para o target GNU do Windows,
+# assim o build funciona mesmo sem mexer no PATH.
+[target.x86_64-pc-windows-gnu]
+linker = "C:/msys64/mingw64/bin/gcc.exe"
+ar = "C:/msys64/mingw64/bin/ar.exe"
