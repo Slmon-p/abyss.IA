@@ -20,6 +20,16 @@ use std::time::Duration;
 // ---- Configuração padrão (pode ser trocada na UI, em ⚙ Configurações) ----
 const DEFAULT_API_KEY: &str = "AQ.Ab8RN6KsIezTPxmcZCPV2ebOHVEaIxsM-DpmzQw_obsIeL4NSg";
 const DEFAULT_MODEL: &str = "gemini-2.5-flash";
+
+/// Modelos Gemini com camada gratuita (free tier). Selecionáveis na barra superior.
+const FREE_MODELS: &[&str] = &[
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+];
 const MAX_AGENT_STEPS: usize = 16;
 
 const CHAT_SYSTEM: &str = "Você é um assistente útil e direto. \
@@ -348,6 +358,16 @@ impl eframe::App for App {
                         ui.label("processando…");
                         ui.spinner();
                     }
+                    ui.add_space(8.0);
+                    egui::ComboBox::from_id_source("model_sel")
+                        .selected_text(self.model.as_str())
+                        .width(170.0)
+                        .show_ui(ui, |ui| {
+                            for m in FREE_MODELS {
+                                ui.selectable_value(&mut self.model, (*m).to_string(), *m);
+                            }
+                        });
+                    ui.label(egui::RichText::new("Gemini:").weak());
                 });
             });
 
