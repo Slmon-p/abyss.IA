@@ -37,7 +37,9 @@ const MAX_AGENT_STEPS: usize = 16;
 
 const CHAT_SYSTEM: &str = "Você é um assistente útil e direto. \
 Responda sempre no idioma do usuário (português quando ele escrever em português). \
-Seja claro, objetivo e formate quando ajudar a leitura.";
+Seja claro e objetivo. SEMPRE coloque código, SQL, comandos ou qualquer trecho destinado a ser \
+copiado dentro de um bloco markdown com três crases (```), indicando a linguagem \
+(ex.: ```sql, ```txt, ```python, ```bash).";
 
 const AGENT_SYSTEM: &str = r#"Você é um AGENTE DEV/AUTOMAÇÃO rodando na máquina Windows do usuário.
 Você trabalha DENTRO de uma PASTA DE TRABALHO (informada abaixo) e pode:
@@ -528,6 +530,79 @@ impl eframe::App for App {
     }
 }
 
+enum Segment {
+    Text(String),
+    Code { lang: String, body: String },
+}
+
+/// Divide o texto em trechos normais e blocos de código (cercas ```...```).
+fn parse_segments(s: &str) -> Vec<Segment> {
+    let mut segs = Vec::new();
+    let mut text = String::new();
+    let mut code = String::new();
+    let mut lang = String::new();
+    let mut in_code = false;
+    for line in s.split_inclusive('\n') {
+        let core = line.trim_end_matches(|c| c == '\n' || c == '\r');
+        if core.trim_start().starts_with("```") {
+            if in_code {
+                segs.push(Segment::Code {
+                    lang: std::mem::take(&mut lang),
+                    body: std::mem::take(&mut code),
+                });
+                in_code = false;
+            } else {
+                if !text.is_empty() {
+                    segs.push(Segment::Text(std::mem::take(&mut text)));
+                }
+                lang = core.trim_start().trim_start_matches("```").trim().to_string();
+                in_code = true;
+            }
+        } else if in_code {
+            code.push_str(line);
+        } else {
+            text.push_str(line);
+        }
+    }
+    if in_code {
+        segs.push(Segment::Code { lang, body: code }); // cerca não fechada
+    } else if !text.is_empty() {
+        segs.push(Segment::Text(text));
+    }
+    segs
+}
+
+/// Caixa de código monoespaçada com cabeçalho (linguagem) e botão Copiar.
+fn code_block(ui: &mut egui::Ui, body: &str, lang: Option<&str>) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(16, 18, 22))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(58)))
+        .rounding(egui::Rounding::same(5.0))
+        .inner_margin(egui::Margin::same(8.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let l = lang
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("texto");
+                ui.label(egui::RichText::new(l).small().weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("📋 Copiar").clicked() {
+                        ui.output_mut(|o| o.copied_text = body.to_string());
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(body)
+                    .monospace()
+                    .color(egui::Color32::from_gray(225)),
+            );
+        });
+    ui.add_space(4.0);
+}
+
 fn draw_msg(ui: &mut egui::Ui, m: &Msg) {
     let (label, label_color, bg, mono) = match m.role {
         Role::User => ("Você", egui::Color32::from_rgb(120, 180, 255), egui::Color32::from_rgb(33, 42, 54), false),
@@ -543,8 +618,29 @@ fn draw_msg(ui: &mut egui::Ui, m: &Msg) {
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(egui::RichText::new(label).strong().color(label_color));
-            let txt = egui::RichText::new(m.text.as_str()).color(egui::Color32::from_gray(228));
-            ui.label(if mono { txt.monospace() } else { txt });
+            if mono {
+                // Comando/saída do agente: já é um bloco monoespaçado com Copiar.
+                let hint = if matches!(m.role, Role::Cmd) { "powershell" } else { "saída" };
+                code_block(ui, m.text.trim_end(), Some(hint));
+            } else {
+                // Texto do modelo: separa blocos ``` em caixas com Copiar.
+                for seg in parse_segments(&m.text) {
+                    match seg {
+                        Segment::Text(t) => {
+                            let t = t.trim_matches(|c| c == '\n' || c == '\r');
+                            if !t.trim().is_empty() {
+                                ui.label(
+                                    egui::RichText::new(t).color(egui::Color32::from_gray(228)),
+                                );
+                            }
+                        }
+                        Segment::Code { lang, body } => {
+                            let body = body.trim_end_matches(|c| c == '\n' || c == '\r');
+                            code_block(ui, body, Some(&lang));
+                        }
+                    }
+                }
+            }
         });
     ui.add_space(6.0);
 }
@@ -1254,8 +1350,31 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_memory_command, safe_join, truncate_str};
+    use super::{detect_memory_command, parse_segments, safe_join, truncate_str, Segment};
     use std::path::Path;
+
+    #[test]
+    fn parse_segments_extrai_bloco_sql() {
+        let s = "Veja a query:\n```sql\nSELECT * FROM t;\n```\npronto";
+        let segs = parse_segments(s);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[0], Segment::Text(t) if t.contains("Veja")));
+        match &segs[1] {
+            Segment::Code { lang, body } => {
+                assert_eq!(lang, "sql");
+                assert!(body.contains("SELECT * FROM t;"));
+            }
+            _ => panic!("esperava bloco de código"),
+        }
+        assert!(matches!(&segs[2], Segment::Text(t) if t.contains("pronto")));
+    }
+
+    #[test]
+    fn parse_segments_texto_puro() {
+        let segs = parse_segments("apenas texto, sem código");
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], Segment::Text(_)));
+    }
 
     fn d(s: &str) -> Option<String> {
         detect_memory_command(s)
