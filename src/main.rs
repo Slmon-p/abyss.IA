@@ -93,6 +93,13 @@ enum WorkerMsg {
     AgentDone(Vec<(String, String)>),
 }
 
+#[derive(Clone)]
+struct MemoryEntry {
+    id: u64,
+    ts: u64,
+    text: String,
+}
+
 struct App {
     mode: Mode,
     input: String,
@@ -103,6 +110,9 @@ struct App {
     auto_run: bool,
     show_settings: bool,
     pending: bool,
+    memory: Vec<MemoryEntry>,
+    mem_path: std::path::PathBuf,
+    next_mem_id: u64,
     tx: mpsc::Sender<WorkerMsg>,
     rx: mpsc::Receiver<WorkerMsg>,
     http: ureq::Agent,
@@ -118,6 +128,9 @@ impl App {
             .timeout_read(Duration::from_secs(180))
             .tls_connector(Arc::new(connector))
             .build();
+        let mem_path = memory_path();
+        let memory = load_memory(&mem_path);
+        let next_mem_id = memory.iter().map(|m| m.id).max().unwrap_or(0);
         Self {
             mode: Mode::Chat,
             input: String::new(),
@@ -128,6 +141,9 @@ impl App {
             auto_run: true,
             show_settings: false,
             pending: false,
+            memory,
+            mem_path,
+            next_mem_id,
             tx,
             rx,
             http,
@@ -148,11 +164,58 @@ impl App {
         }
     }
 
+    fn add_memory(&mut self, text: String) {
+        self.next_mem_id += 1;
+        self.memory.push(MemoryEntry {
+            id: self.next_mem_id,
+            ts: now_secs(),
+            text,
+        });
+        save_memory(&self.mem_path, &self.memory);
+    }
+
+    fn remove_memory(&mut self, id: u64) {
+        self.memory.retain(|m| m.id != id);
+        save_memory(&self.mem_path, &self.memory);
+    }
+
+    fn clear_memory(&mut self) {
+        self.memory.clear();
+        save_memory(&self.mem_path, &self.memory);
+    }
+
+    /// Bloco com as memórias para injetar na systemInstruction.
+    fn memory_preamble(&self) -> String {
+        if self.memory.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from(
+            "\n\nMEMÓRIA DO USUÁRIO (fatos e instruções que ele salvou; lembre-se e respeite sempre):\n",
+        );
+        for m in &self.memory {
+            s.push_str("- ");
+            s.push_str(&m.text);
+            s.push('\n');
+        }
+        s
+    }
+
     fn send(&mut self, ctx: &egui::Context) {
         let text = self.input.trim().to_string();
         if text.is_empty() || self.pending {
             return;
         }
+
+        // MEMÓRIA: "salve isso na memória ..." → grava no JSON e confirma (sem chamar a API).
+        if let Some(mem) = detect_memory_command(&text) {
+            self.input.clear();
+            self.add_memory(mem.clone());
+            self.cur_mut()
+                .transcript
+                .push(Msg::new(Role::Model, format!("🧠 Salvo na memória: \"{mem}\"")));
+            return;
+        }
+
         if self.api_key.trim().is_empty() {
             self.cur_mut()
                 .transcript
@@ -170,17 +233,19 @@ impl App {
 
         match self.mode {
             Mode::Chat => {
+                let system = format!("{CHAT_SYSTEM}{}", self.memory_preamble());
                 self.chat.transcript.push(Msg::new(Role::User, text.clone()));
                 self.chat.history.push(("user".into(), text));
                 let history = self.chat.history.clone();
-                spawn_chat(ctx2, tx, http, key, model, history);
+                spawn_chat(ctx2, tx, http, key, model, system, history);
             }
             Mode::Agent => {
+                let system = format!("{AGENT_SYSTEM}{}", self.memory_preamble());
                 self.agent.transcript.push(Msg::new(Role::User, text.clone()));
                 self.agent.history.push(("user".into(), text));
                 let history = self.agent.history.clone();
                 let auto = self.auto_run;
-                spawn_agent(ctx2, tx, http, key, model, history, auto);
+                spawn_agent(ctx2, tx, http, key, model, system, history, auto);
             }
         }
     }
@@ -265,6 +330,36 @@ impl eframe::App for App {
                         ui.label("Modelo: ");
                         ui.add(egui::TextEdit::singleline(&mut self.model).desired_width(240.0));
                     });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("🧠 Memória ({})", self.memory.len()));
+                        ui.label(
+                            egui::RichText::new("— diga: \"salve isso na memória ...\"")
+                                .small()
+                                .weak(),
+                        );
+                        if !self.memory.is_empty() && ui.button("Limpar tudo").clicked() {
+                            self.clear_memory();
+                        }
+                    });
+                    let mut remove_id: Option<u64> = None;
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for m in &self.memory {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("✕").clicked() {
+                                        remove_id = Some(m.id);
+                                    }
+                                    ui.label(egui::RichText::new(m.text.as_str()).small());
+                                });
+                            }
+                        });
+                    if let Some(id) = remove_id {
+                        self.remove_memory(id);
+                    }
                 });
             }
             ui.add_space(4.0);
@@ -418,6 +513,126 @@ fn call_gemini(
     }
 }
 
+// ----------------------------- Memória (JSON persistente) -----------------------------
+
+fn memory_path() -> std::path::PathBuf {
+    let mut dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.push("abyss_memory.json");
+    dir
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn load_memory(path: &std::path::Path) -> Vec<MemoryEntry> {
+    let data = std::fs::read_to_string(path).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&data).unwrap_or_else(|_| json!({}));
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("memories").and_then(|x| x.as_array()) {
+        for m in arr {
+            let text = m
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                continue;
+            }
+            out.push(MemoryEntry {
+                id: m.get("id").and_then(|x| x.as_u64()).unwrap_or(0),
+                ts: m.get("ts").and_then(|x| x.as_u64()).unwrap_or(0),
+                text,
+            });
+        }
+    }
+    out
+}
+
+fn save_memory(path: &std::path::Path, mems: &[MemoryEntry]) {
+    let arr: Vec<serde_json::Value> = mems
+        .iter()
+        .map(|m| json!({ "id": m.id, "ts": m.ts, "text": m.text }))
+        .collect();
+    let v = json!({ "memories": arr });
+    let _ = std::fs::write(path, serde_json::to_string_pretty(&v).unwrap_or_default());
+}
+
+/// Busca case-insensitive que devolve (início, fim) em bytes na string ORIGINAL.
+fn ci_find(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let h = haystack.to_lowercase();
+    let n = needle.to_lowercase();
+    let bpos = h.find(&n)?;
+    let char_start = h[..bpos].chars().count();
+    let char_end = char_start + n.chars().count();
+    let start = haystack.char_indices().nth(char_start).map(|(i, _)| i).unwrap_or(0);
+    let end = haystack
+        .char_indices()
+        .nth(char_end)
+        .map(|(i, _)| i)
+        .unwrap_or(haystack.len());
+    Some((start, end))
+}
+
+/// Detecta "salve isso na memória ..." e devolve só o conteúdo (a lógica) a memorizar.
+fn detect_memory_command(text: &str) -> Option<String> {
+    const TRIGGERS: &[&str] = &[
+        "salve isso na memória",
+        "salve isso na memoria",
+        "salva isso na memória",
+        "salva isso na memoria",
+        "salvar isso na memória",
+        "salvar isso na memoria",
+        "salve na memória",
+        "salve na memoria",
+        "salva na memória",
+        "salva na memoria",
+        "salvar na memória",
+        "salvar na memoria",
+        "guarde na memória",
+        "guarde na memoria",
+        "adicione à memória",
+        "adicione a memoria",
+        "anote na memória",
+        "anote na memoria",
+        "grave na memória",
+        "grave na memoria",
+        "memorize isso",
+        "memoriza isso",
+        "lembre-se disso",
+        "lembre disso",
+    ];
+    let lower = text.to_lowercase();
+    let trigger = TRIGGERS.iter().find(|t| lower.contains(**t))?;
+    let (start, end) = ci_find(text, trigger)?;
+
+    let mut content = String::new();
+    content.push_str(text[..start].trim());
+    if !content.is_empty() {
+        content.push(' ');
+    }
+    content.push_str(text[end..].trim());
+
+    let content = content
+        .trim()
+        .trim_start_matches(|c: char| matches!(c, ':' | '-' | '—' | ',' | '.' | ' '))
+        .trim_end_matches(|c: char| matches!(c, ',' | ';' | ' '))
+        .trim();
+    let content = content.strip_prefix("que ").unwrap_or(content).trim();
+    if content.is_empty() {
+        None
+    } else {
+        Some(content.to_string())
+    }
+}
+
 fn run_powershell(script: &str) -> String {
     let wrapped = format!(
         "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script}"
@@ -464,12 +679,13 @@ fn spawn_chat(
     http: ureq::Agent,
     key: String,
     model: String,
+    system: String,
     history: Vec<(String, String)>,
 ) {
     thread::spawn(move || {
         let body = json!({
             "contents": contents_from(&history),
-            "systemInstruction": { "parts": [{ "text": CHAT_SYSTEM }] },
+            "systemInstruction": { "parts": [{ "text": system }] },
             "generationConfig": { "temperature": 0.7 }
         });
         let msg = match call_gemini(&http, &key, &model, body) {
@@ -490,6 +706,7 @@ fn spawn_agent(
     http: ureq::Agent,
     key: String,
     model: String,
+    system: String,
     mut history: Vec<(String, String)>,
     auto_run: bool,
 ) {
@@ -507,7 +724,7 @@ fn spawn_agent(
         for _ in 0..MAX_AGENT_STEPS {
             let body = json!({
                 "contents": contents_from(&history),
-                "systemInstruction": { "parts": [{ "text": AGENT_SYSTEM }] },
+                "systemInstruction": { "parts": [{ "text": system.as_str() }] },
                 "generationConfig": {
                     "temperature": 0.2,
                     "responseMimeType": "application/json",
@@ -608,4 +825,53 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Ok(Box::new(App::new(cc)) as Box<dyn eframe::App>)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_memory_command;
+
+    fn d(s: &str) -> Option<String> {
+        detect_memory_command(s)
+    }
+
+    #[test]
+    fn gatilho_no_inicio_com_dois_pontos() {
+        assert_eq!(
+            d("salve isso na memória: responda sempre em português").as_deref(),
+            Some("responda sempre em português")
+        );
+    }
+
+    #[test]
+    fn gatilho_no_fim_sem_virgula_sobrando() {
+        assert_eq!(
+            d("meu nome é Simon, guarde na memória").as_deref(),
+            Some("meu nome é Simon")
+        );
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert_eq!(
+            d("SALVE ISSO NA MEMÓRIA: beba água").as_deref(),
+            Some("beba água")
+        );
+    }
+
+    #[test]
+    fn outra_variacao() {
+        assert_eq!(d("memorize isso: gosto de café").as_deref(), Some("gosto de café"));
+    }
+
+    #[test]
+    fn sem_gatilho_retorna_none() {
+        assert_eq!(d("como eu salvo um arquivo no Word?"), None);
+        assert_eq!(d("abra a calculadora"), None);
+    }
+
+    #[test]
+    fn gatilho_sozinho_sem_conteudo_e_none() {
+        assert_eq!(d("salve isso na memória"), None);
+    }
 }

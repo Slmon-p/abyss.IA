@@ -131,7 +131,7 @@ O binário final fica em: `target\release\abyss.exe`.
 
 ## 5. Usando
 
-**IA Normal:** digite e `Ctrl+Enter` (ou botão **Enviar**).
+**IA Normal:** digite e aperte **Enter** (ou botão **Enviar**).
 
 **Agente Local:** descreva a tarefa. Exemplos:
 - "olá" → ele só responde.
@@ -143,3 +143,24 @@ O binário final fica em: `target\release\abyss.exe`.
 > ⚠️ **Segurança:** no modo Agente o app executa comandos REAIS. Há um botão
 > **"Executar comandos automaticamente"** — desligue-o para ver o comando que o
 > modelo gerou **sem** rodá-lo (modo seguro / revisão).
+
+---
+
+## 6. Memória persistente (`abyss_memory.json`)
+
+O Abyss lembra de fatos e instruções suas entre sessões.
+
+- **Para salvar:** comece (ou termine) a mensagem com um gatilho, por exemplo
+  **"salve isso na memória: …"**. Outros gatilhos aceitos: *salva/salvar na memória,
+  guarde na memória, anote na memória, grave na memória, memorize isso, lembre-se disso*.
+  O app extrai **a lógica do que você pediu** e grava — sem gastar chamada de API.
+  - Ex.: `salve isso na memória: sempre me responda em português e de forma curta`
+  - Ex.: `meu nome é Simon, guarde na memória`
+- **Onde fica:** um JSON ao lado do executável → `abyss_memory.json`:
+  ```json
+  { "memories": [ { "id": 1, "ts": 1780871899, "text": "sempre responda curto" } ] }
+  ```
+- **Como é usado:** a cada mensagem (Chat **e** Agente), todas as memórias são injetadas
+  na `systemInstruction` enviada ao Gemini — então ele realmente lembra e respeita.
+- **Gerenciar:** em **⚙ Configurações** há a seção **🧠 Memória (N)** para ver cada item,
+  remover com **✕** ou **Limpar tudo**.
