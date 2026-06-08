@@ -509,23 +509,14 @@ impl eframe::App for App {
 
         // ----- Centro: transcrição da conversa -----
         egui::CentralPanel::default().show(ctx, |ui| {
-            let (transcript, empty_hint) = match self.mode {
-                Mode::Chat => (&self.chat.transcript, "Converse normalmente com o Gemini."),
-                Mode::Agent => (
-                    &self.agent.transcript,
-                    "Dê uma ordem e o agente executa no seu PC. Ex.: \"abra a calculadora\", \"crie uma planilha no desktop com nomes na coluna A\".",
-                ),
+            let transcript = match self.mode {
+                Mode::Chat => &self.chat.transcript,
+                Mode::Agent => &self.agent.transcript,
             };
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    if transcript.is_empty() {
-                        ui.add_space(24.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(egui::RichText::new(empty_hint).weak());
-                        });
-                    }
                     for m in transcript {
                         draw_msg(ui, m);
                     }
