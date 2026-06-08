@@ -3,11 +3,14 @@
 // Backend (lógica): chamadas HTTP à API do Gemini + execução de comandos no SO.
 // Frontend (UI):     egui/eframe (OpenGL, sem Chromium/WebView).
 //
-// Dois modos:
-//   - IA Normal:    chat de texto comum.
-//   - Agente Local: a IA recebe a tarefa, decide e EXECUTA comandos PowerShell reais
-//                   no Windows (abrir programas, criar pastas, mexer no Excel, etc.),
-//                   em laço passo-a-passo, lendo a saída de cada comando.
+// Um só lugar (sem modos separados): o Abyss AI decide sozinho a cada mensagem.
+//   - Se você PERGUNTA / conversa, ele RESPONDE.
+//   - Se você MANDA fazer algo, ele EXECUTA comandos PowerShell reais e edita
+//     arquivos no Windows, em laço passo-a-passo, lendo a saída de cada comando.
+//
+// Resiliência de modelos: se um modelo bate o limite de requisições, troca para o
+// próximo em silêncio; se TODOS falham, mostra "Modelos recarregando, aguarde…",
+// espera 60s e tenta tudo de novo — nunca para com erro.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // sem janela de console no release
 
@@ -39,13 +42,12 @@ const FLASH_MODELS: &[&str] = &[
 const PRO_MODELS: &[&str] = &["gemini-2.5-pro", "gemini-1.5-pro"];
 const MAX_AGENT_STEPS: usize = 16;
 
-const CHAT_SYSTEM: &str = "Você é um assistente útil e direto. \
-Responda sempre no idioma do usuário (português quando ele escrever em português). \
-Seja claro e objetivo. SEMPRE coloque código, SQL, comandos ou qualquer trecho destinado a ser \
-copiado dentro de um bloco markdown com três crases (```), indicando a linguagem \
-(ex.: ```sql, ```txt, ```python, ```bash).";
+const AGENT_SYSTEM: &str = r#"Você é o Abyss AI, um assistente que CONVERSA e também EXECUTA tarefas reais na máquina Windows do usuário. A sua identidade é Abyss AI; o Google Gemini é apenas o MOTOR/modelo por baixo, NÃO a sua identidade. Quando perguntarem seu nome ou quem você é, responda que é o Abyss AI; NUNCA se apresente como "Gemini" nem como "um modelo treinado pelo Google".
 
-const AGENT_SYSTEM: &str = r#"Você é um AGENTE DEV/AUTOMAÇÃO rodando na máquina Windows do usuário.
+A cada mensagem, decida você mesmo o que fazer:
+- Se o usuário apenas PERGUNTA, conversa, pede uma explicação ou um código (sem pedir ação no PC): RESPONDA direto e COMPLETO no campo "explanation", no idioma do usuário (português quando ele escrever em português). Use action="finish" e task_complete=true. Coloque QUALQUER código, SQL, comando ou trecho para copiar dentro de um bloco markdown com três crases (```), indicando a linguagem (ex.: ```sql, ```python, ```bash).
+- Se o usuário PEDE uma AÇÃO no computador (abrir programas, criar/editar arquivos, mexer em pastas, rodar comandos): EXECUTE passo a passo usando as ações abaixo.
+
 Você tem acesso ao COMPUTADOR INTEIRO (qualquer pasta/arquivo do Windows) e pode:
 - ler arquivos (para entender antes de editar),
 - criar/editar QUALQUER tipo de arquivo de texto (código, config, .md, .json, .html, etc.),
@@ -58,12 +60,12 @@ Sobre pastas (NÃO existe pasta fixa de trabalho):
 - Descubra pastas com comandos: $env:USERPROFILE, [Environment]::GetFolderPath('Desktop'), Get-ChildItem.
 
 Para CADA passo responda SOMENTE com um objeto JSON:
-- "explanation": em português, 1-2 frases, o que fará neste passo (ou o resumo final).
+- "explanation": em português. Num passo de tarefa: 1-2 frases do que fará neste passo (ou o resumo final). Numa resposta a pergunta/conversa: escreva aqui a RESPOSTA COMPLETA (pode ser longa, com blocos ```).
 - "action": "read_file" | "write_file" | "run" | "change_dir" | "finish".
 - "path": caminho do arquivo (read_file/write_file) ou da pasta (change_dir). Relativo resolve na pasta atual; absoluto vai direto.
 - "content": o conteúdo COMPLETO e final do arquivo (apenas para write_file; sobrescreve o arquivo inteiro — NÃO use diffs/trechos).
 - "powershell": o comando (apenas para action="run").
-- "task_complete": true quando a tarefa inteira terminou.
+- "task_complete": true quando a tarefa inteira terminou (ou quando foi só conversa/pergunta).
 
 Depois de cada passo você recebe o resultado (saída do comando, conteúdo do arquivo, ou confirmação de escrita) e decide o próximo.
 
@@ -72,16 +74,10 @@ Regras:
 - Para CRIAR arquivo novo: write_file direto com o conteúdo.
 - Comandos PowerShell NÃO interativos. Abrir programas: Start-Process (ex.: Start-Process notepad).
 - Faça UM passo objetivo por vez. Não invente caminhos; use read_file ou "run" (ex.: Get-ChildItem) para descobrir.
-- Se for só conversa/saudação ("olá"), use action="finish" e task_complete=true.
-- Ao terminar, action="finish", path/content/powershell vazios, task_complete=true, e um resumo na "explanation"."#;
+- Se for só conversa/pergunta/saudação ("olá"), responda completo na "explanation", com action="finish" e task_complete=true.
+- Ao terminar uma tarefa, action="finish", path/content/powershell vazios, task_complete=true, e um resumo na "explanation"."#;
 
 // ----------------------------- Modelo de dados da UI -----------------------------
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Mode {
-    Chat,
-    Agent,
-}
 
 #[derive(Clone, Copy)]
 enum Role {
@@ -111,14 +107,14 @@ struct ModeState {
 
 // Mensagens vindas das threads de trabalho para a UI.
 enum WorkerMsg {
-    Chat(String),
-    ChatErr(String),
     AgentSay(String),
     AgentCmd(String),
     AgentOut(String),
     AgentErr(String),
     AgentDone(Vec<(String, String)>),
     WorkDir(String),
+    /// Todos os modelos estão em cota/limite: mostra "recarregando" e segue tentando.
+    Status(String),
 }
 
 #[derive(Clone)]
@@ -129,15 +125,14 @@ struct MemoryEntry {
 }
 
 struct App {
-    mode: Mode,
     input: String,
-    chat: ModeState,
-    agent: ModeState,
+    convo: ModeState,
     api_key: String,
     model: String,
     auto_run: bool,
     show_settings: bool,
     pending: bool,
+    status: Option<String>,
     memory: Vec<MemoryEntry>,
     mem_path: std::path::PathBuf,
     next_mem_id: u64,
@@ -168,15 +163,14 @@ impl App {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| project_root.to_string_lossy().to_string());
         Self {
-            mode: Mode::Chat,
             input: String::new(),
-            chat: ModeState::default(),
-            agent: ModeState::default(),
+            convo: ModeState::default(),
             api_key: DEFAULT_API_KEY.to_string(),
             model: DEFAULT_MODEL.to_string(),
             auto_run: true,
             show_settings: false,
             pending: false,
+            status: None,
             memory,
             mem_path,
             next_mem_id,
@@ -189,17 +183,11 @@ impl App {
     }
 
     fn cur_mut(&mut self) -> &mut ModeState {
-        match self.mode {
-            Mode::Chat => &mut self.chat,
-            Mode::Agent => &mut self.agent,
-        }
+        &mut self.convo
     }
 
     fn clear_current(&mut self) {
-        match self.mode {
-            Mode::Chat => self.chat = ModeState::default(),
-            Mode::Agent => self.agent = ModeState::default(),
-        }
+        self.convo = ModeState::default();
     }
 
     fn add_memory(&mut self, text: String) {
@@ -268,29 +256,21 @@ impl App {
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         self.pending = true;
+        self.status = None;
 
-        match self.mode {
-            Mode::Chat => {
-                let system = format!("{CHAT_SYSTEM}{}", self.memory_preamble());
-                self.chat.transcript.push(Msg::new(Role::User, text.clone()));
-                self.chat.history.push(("user".into(), text));
-                let history = self.chat.history.clone();
-                spawn_chat(ctx2, tx, http, key, models, system, history);
-            }
-            Mode::Agent => {
-                let work_dir = std::path::PathBuf::from(self.work_dir.trim());
-                let system = format!(
-                    "{AGENT_SYSTEM}\n\nPASTA ATUAL: {}\n{}",
-                    work_dir.display(),
-                    self.memory_preamble()
-                );
-                self.agent.transcript.push(Msg::new(Role::User, text.clone()));
-                self.agent.history.push(("user".into(), text));
-                let history = self.agent.history.clone();
-                let auto = self.auto_run;
-                spawn_agent(ctx2, tx, http, key, models, system, history, work_dir, auto);
-            }
-        }
+        // Um só lugar: o próprio Abyss AI decide se RESPONDE (pergunta/conversa)
+        // ou EXECUTA (tarefa no PC). Tudo passa pelo mesmo loop.
+        let work_dir = std::path::PathBuf::from(self.work_dir.trim());
+        let system = format!(
+            "{AGENT_SYSTEM}\n\nPASTA ATUAL: {}\n{}",
+            work_dir.display(),
+            self.memory_preamble()
+        );
+        self.convo.transcript.push(Msg::new(Role::User, text.clone()));
+        self.convo.history.push(("user".into(), text));
+        let history = self.convo.history.clone();
+        let auto = self.auto_run;
+        spawn_agent(ctx2, tx, http, key, models, system, history, work_dir, auto);
     }
 
     fn start_self_update(&mut self, ctx: &egui::Context) {
@@ -299,20 +279,20 @@ impl App {
         }
         let instruction = self.input.trim().to_string();
         if instruction.is_empty() {
-            self.agent.transcript.push(Msg::new(
+            self.convo.transcript.push(Msg::new(
                 Role::Error,
-                "Escreva no campo o que você quer mudar no Abyss e então clique em 🔄 Auto-update.",
+                "Escreva no campo o que você quer mudar no Abyss AI e então clique em 🔄 Auto-update.",
             ));
             return;
         }
         if self.api_key.trim().is_empty() {
-            self.agent
+            self.convo
                 .transcript
                 .push(Msg::new(Role::Error, "Configure sua API Key em ⚙ Configurações."));
             return;
         }
         self.input.clear();
-        self.agent
+        self.convo
             .transcript
             .push(Msg::new(Role::User, format!("🔄 Auto-update: {instruction}")));
         self.pending = true;
@@ -331,24 +311,30 @@ impl App {
     fn drain(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WorkerMsg::Chat(t) => {
-                    self.chat.transcript.push(Msg::new(Role::Model, t.clone()));
-                    self.chat.history.push(("model".into(), t));
-                    self.pending = false;
+                // Qualquer progresso real limpa o aviso de "recarregando".
+                WorkerMsg::AgentSay(t) => {
+                    self.status = None;
+                    self.convo.transcript.push(Msg::new(Role::Model, t));
                 }
-                WorkerMsg::ChatErr(e) => {
-                    self.chat.transcript.push(Msg::new(Role::Error, e));
-                    self.pending = false;
+                WorkerMsg::AgentCmd(c) => {
+                    self.status = None;
+                    self.convo.transcript.push(Msg::new(Role::Cmd, c));
                 }
-                WorkerMsg::AgentSay(t) => self.agent.transcript.push(Msg::new(Role::Model, t)),
-                WorkerMsg::AgentCmd(c) => self.agent.transcript.push(Msg::new(Role::Cmd, c)),
-                WorkerMsg::AgentOut(o) => self.agent.transcript.push(Msg::new(Role::Output, o)),
-                WorkerMsg::AgentErr(e) => self.agent.transcript.push(Msg::new(Role::Error, e)),
+                WorkerMsg::AgentOut(o) => {
+                    self.status = None;
+                    self.convo.transcript.push(Msg::new(Role::Output, o));
+                }
+                WorkerMsg::AgentErr(e) => {
+                    self.status = None;
+                    self.convo.transcript.push(Msg::new(Role::Error, e));
+                }
                 WorkerMsg::AgentDone(h) => {
-                    self.agent.history = h;
+                    self.convo.history = h;
                     self.pending = false;
+                    self.status = None;
                 }
                 WorkerMsg::WorkDir(p) => self.work_dir = p,
+                WorkerMsg::Status(s) => self.status = Some(s),
             }
         }
     }
@@ -358,14 +344,15 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
 
-        // ----- Topo: título, seletor de modo, ações, configurações -----
+        // ----- Topo: título, ações, seletor de modelos, configurações -----
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("Abyss");
+                ui.heading("Abyss AI");
                 ui.separator();
-                ui.selectable_value(&mut self.mode, Mode::Chat, "💬 IA Normal");
-                ui.selectable_value(&mut self.mode, Mode::Agent, "🤖 Agente Local");
+                ui.label(
+                    egui::RichText::new("pergunte ou mande fazer — tudo no mesmo lugar").weak(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("🗑 Limpar").clicked() {
                         self.clear_current();
@@ -374,7 +361,14 @@ impl eframe::App for App {
                         self.show_settings = !self.show_settings;
                     }
                     if self.pending {
-                        ui.label("processando…");
+                        if let Some(s) = &self.status {
+                            ui.label(
+                                egui::RichText::new(s.as_str())
+                                    .color(egui::Color32::from_rgb(220, 160, 60)),
+                            );
+                        } else {
+                            ui.label("processando…");
+                        }
                         ui.spinner();
                     }
                     ui.add_space(8.0);
@@ -396,32 +390,30 @@ impl eframe::App for App {
                                 ui.selectable_value(&mut self.model, (*m).to_string(), *m);
                             }
                         });
-                    ui.label(egui::RichText::new("Gemini:").weak());
+                    ui.label(egui::RichText::new("Modelos:").weak());
                 });
             });
 
-            if self.mode == Mode::Agent {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.auto_run, "Executar automaticamente");
-                    ui.label(
-                        egui::RichText::new("⚠ roda comandos/edições REAIS · acesso a todo o PC")
-                            .small()
-                            .color(egui::Color32::from_rgb(220, 160, 60)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!self.pending, egui::Button::new("🔄 Auto-update Abyss"))
-                            .on_hover_text(
-                                "Salva no Git, edita uma cópia (updateabyss), compila e promove se passar.\n\
-                                 Escreva no campo de baixo O QUE mudar e clique aqui.",
-                            )
-                            .clicked()
-                        {
-                            self.start_self_update(ctx);
-                        }
-                    });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.auto_run, "Executar automaticamente");
+                ui.label(
+                    egui::RichText::new("⚠ roda comandos/edições REAIS · acesso a todo o PC")
+                        .small()
+                        .color(egui::Color32::from_rgb(220, 160, 60)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!self.pending, egui::Button::new("🔄 Auto-update Abyss AI"))
+                        .on_hover_text(
+                            "Salva no Git, edita uma cópia (updateabyss), compila e promove se passar.\n\
+                             Escreva no campo de baixo O QUE mudar e clique aqui.",
+                        )
+                        .clicked()
+                    {
+                        self.start_self_update(ctx);
+                    }
                 });
-            }
+            });
 
             if self.show_settings {
                 ui.add_space(2.0);
@@ -476,12 +468,7 @@ impl eframe::App for App {
         // ----- Rodapé: campo de entrada + botão enviar -----
         egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
             ui.add_space(6.0);
-            let hint = match self.mode {
-                Mode::Chat => "Pergunte algo…  (Enter envia)",
-                Mode::Agent => {
-                    "Descreva a tarefa (ex.: crie uma pasta 'Projetos' na área de trabalho)…  (Enter envia)"
-                }
-            };
+            let hint = "Pergunte algo ou descreva uma tarefa (ex.: crie uma pasta 'Projetos' na área de trabalho)…  (Enter envia)";
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.input)
                     .hint_text(hint)
@@ -495,11 +482,7 @@ impl eframe::App for App {
                 if ui.add_enabled(!self.pending, egui::Button::new("Enviar  ➤")).clicked() {
                     do_send = true;
                 }
-                let modo = match self.mode {
-                    Mode::Chat => "IA Normal",
-                    Mode::Agent => "Agente Local",
-                };
-                ui.label(egui::RichText::new(format!("modo: {modo}  ·  {}", self.model)).weak());
+                ui.label(egui::RichText::new(format!("Abyss AI  ·  {}", self.model)).weak());
             });
             if (do_send || enter_send) && !self.pending {
                 self.send(ctx);
@@ -510,10 +493,7 @@ impl eframe::App for App {
 
         // ----- Centro: transcrição da conversa -----
         egui::CentralPanel::default().show(ctx, |ui| {
-            let transcript = match self.mode {
-                Mode::Chat => &self.chat.transcript,
-                Mode::Agent => &self.agent.transcript,
-            };
+            let transcript = &self.convo.transcript;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
@@ -602,7 +582,7 @@ fn code_block(ui: &mut egui::Ui, body: &str, lang: Option<&str>) {
 fn draw_msg(ui: &mut egui::Ui, m: &Msg) {
     let (label, label_color, bg, mono) = match m.role {
         Role::User => ("Você", egui::Color32::from_rgb(120, 180, 255), egui::Color32::from_rgb(33, 42, 54), false),
-        Role::Model => ("Gemini", egui::Color32::from_rgb(150, 220, 150), egui::Color32::from_rgb(30, 34, 40), false),
+        Role::Model => ("Abyss AI", egui::Color32::from_rgb(150, 220, 150), egui::Color32::from_rgb(30, 34, 40), false),
         Role::Cmd => ("▶ PowerShell", egui::Color32::from_rgb(255, 200, 120), egui::Color32::from_rgb(42, 35, 22), true),
         Role::Output => ("⤷ Saída", egui::Color32::from_rgb(170, 170, 170), egui::Color32::from_rgb(22, 24, 26), true),
         Role::Error => ("Erro", egui::Color32::from_rgb(255, 120, 120), egui::Color32::from_rgb(48, 26, 26), false),
@@ -717,31 +697,38 @@ fn ordered_models(selected: &str) -> Vec<String> {
     v
 }
 
-/// Tenta os modelos em ordem; se um falhar (cota/erro), passa para o próximo até um responder.
-fn call_gemini_fallback(
+/// Tempo de espera (segundos) antes de tentar todos os modelos de novo, quando TODOS falham.
+const RELOAD_WAIT_SECS: u64 = 60;
+
+/// Chama os modelos em ordem, repetidamente, até um responder. NUNCA falha de vez.
+/// - Se um modelo der limite/cota/erro, passa para o PRÓXIMO em silêncio (sem mostrar erro).
+/// - Se TODOS falharem na rodada, manda o aviso "Modelos recarregando, aguarde…",
+///   espera ~60s e tenta tudo de novo. Devolve o texto da resposta assim que algum modelo responder.
+fn call_gemini_resilient(
     http: &ureq::Agent,
     key: &str,
     models: &[String],
     body: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let mut last = String::from("nenhum modelo disponível");
-    for model in models {
-        match call_gemini(http, key, model, body.clone()) {
-            Ok(v) => {
-                if v.get("candidates").and_then(|c| c.get(0)).is_some() {
-                    return Ok(v);
+    tx: &mpsc::Sender<WorkerMsg>,
+    ctx: &egui::Context,
+) -> String {
+    loop {
+        for model in models {
+            if let Ok(v) = call_gemini(http, key, model, body.clone()) {
+                if let Some(text) = extract_text(&v) {
+                    return text;
                 }
-                last = format!(
-                    "{model}: {}",
-                    v.get("error")
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "resposta sem candidatos".to_string())
-                );
             }
-            Err(e) => last = format!("{model}: {e}"),
+            // Falhou (limite/cota/rede/sem texto) → tenta o próximo, sem mostrar erro.
+        }
+        // Todos os modelos falharam nesta rodada: avisa e espera, sem erro nem parada.
+        let _ = tx.send(WorkerMsg::Status("⏳ Modelos recarregando, aguarde…".to_string()));
+        ctx.request_repaint();
+        for _ in 0..RELOAD_WAIT_SECS {
+            thread::sleep(Duration::from_secs(1));
+            ctx.request_repaint(); // mantém a UI viva e o spinner girando durante a espera
         }
     }
-    Err(format!("Todos os modelos falharam — último: {last}"))
 }
 
 // ----------------------------- Memória (JSON persistente) -----------------------------
@@ -1045,35 +1032,8 @@ fn run_powershell(script: &str, work_dir: &std::path::Path) -> String {
     }
 }
 
-fn spawn_chat(
-    ctx: egui::Context,
-    tx: mpsc::Sender<WorkerMsg>,
-    http: ureq::Agent,
-    key: String,
-    models: Vec<String>,
-    system: String,
-    history: Vec<(String, String)>,
-) {
-    thread::spawn(move || {
-        let body = json!({
-            "contents": contents_from(&history),
-            "systemInstruction": { "parts": [{ "text": system }] },
-            "generationConfig": { "temperature": 0.7 }
-        });
-        let msg = match call_gemini_fallback(&http, &key, &models, body) {
-            Ok(v) => match extract_text(&v) {
-                Some(t) => WorkerMsg::Chat(t),
-                None => WorkerMsg::ChatErr(format!("Sem resposta utilizável da API: {v}")),
-            },
-            Err(e) => WorkerMsg::ChatErr(e),
-        };
-        let _ = tx.send(msg);
-        ctx.request_repaint();
-    });
-}
-
 /// Núcleo do agente: loop de passos (read_file / write_file / run) na pasta de trabalho.
-/// Devolve true se terminou normalmente; false se houve erro de API (já reportado).
+/// Usa a chamada resiliente: nunca para por erro de API (troca de modelo / espera e tenta de novo).
 #[allow(clippy::too_many_arguments)]
 fn run_agent_loop(
     ctx: &egui::Context,
@@ -1086,7 +1046,7 @@ fn run_agent_loop(
     work_dir: &mut std::path::PathBuf,
     auto_run: bool,
     max_steps: usize,
-) -> bool {
+) {
     let schema = json!({
         "type": "object",
         "properties": {
@@ -1111,22 +1071,9 @@ fn run_agent_loop(
             }
         });
 
-        let v = match call_gemini_fallback(http, key, models, body) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = tx.send(WorkerMsg::AgentErr(e));
-                ctx.request_repaint();
-                return false;
-            }
-        };
-        let raw = match extract_text(&v) {
-            Some(t) => t,
-            None => {
-                let _ = tx.send(WorkerMsg::AgentErr(format!("Sem resposta utilizável: {v}")));
-                ctx.request_repaint();
-                return false;
-            }
-        };
+        // Chamada resiliente: troca de modelo em silêncio em caso de limite/cota,
+        // avisa "recarregando" e tenta de novo a cada 60s. Nunca para por erro de API.
+        let raw = call_gemini_resilient(http, key, models, body, tx, ctx);
         history.push(("model".into(), raw.clone()));
 
         let parsed: serde_json::Value = serde_json::from_str(&raw)
@@ -1185,7 +1132,7 @@ fn run_agent_loop(
                         "⏸ Execução automática DESLIGADA — comando não executado.".into(),
                     ));
                     ctx.request_repaint();
-                    return true;
+                    return;
                 }
                 let output = run_powershell(&ps, work_dir.as_path());
                 let _ = tx.send(WorkerMsg::AgentOut(output.clone()));
@@ -1199,7 +1146,6 @@ fn run_agent_loop(
             break;
         }
     }
-    true
 }
 
 fn spawn_agent(
@@ -1286,7 +1232,7 @@ fn spawn_self_update(
                 return;
             }
             format!(
-                "Você está editando uma CÓPIA do projeto Abyss (app Rust/egui em src/main.rs). \
+                "Você está editando uma CÓPIA do projeto Abyss AI (app Rust/egui em src/main.rs). \
                  Faça a alteração pedida editando os arquivos necessários (use read_file e write_file com o conteúdo COMPLETO). \
                  NÃO rode 'cargo build' — eu compilo depois. Pedido do usuário: {instruction}"
             )
@@ -1300,15 +1246,9 @@ fn spawn_self_update(
         );
         let mut history: Vec<(String, String)> = vec![("user".to_string(), seed)];
         let mut wd = update_dir.clone();
-        let ok_loop = run_agent_loop(
+        run_agent_loop(
             &ctx, &tx, &http, &key, &models, &system, &mut history, &mut wd, true, 24,
         );
-        if !ok_loop {
-            say("Interrompido por erro de API. A pasta 'updateabyss' foi mantida para retomar depois.".into());
-            let _ = tx.send(WorkerMsg::AgentDone(history));
-            ctx.request_repaint();
-            return;
-        }
 
         say("🛠 Compilando a cópia (cargo build)… na 1ª vez pode levar alguns minutos.".into());
         let (built, log) = build_dir(&update_dir);
@@ -1353,12 +1293,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 640.0])
             .with_min_inner_size([520.0, 400.0])
-            .with_title("Abyss")
+            .with_title("Abyss AI")
             .with_icon(Arc::new(load_icon())),
         ..Default::default()
     };
     eframe::run_native(
-        "Abyss",
+        "Abyss AI",
         native_options,
         Box::new(|cc| Ok(Box::new(App::new(cc)) as Box<dyn eframe::App>)),
     )
