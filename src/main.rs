@@ -13,7 +13,11 @@
 
 use eframe::egui;
 use serde_json::json;
+use std::os::windows::process::CommandExt; // creation_flags (esconder janela do console)
 use std::sync::{mpsc, Arc};
+
+/// Flag do Windows para NÃO abrir janela de console ao rodar processos (powershell/cmd).
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 use std::thread;
 use std::time::Duration;
 
@@ -47,14 +51,16 @@ Você tem acesso ao COMPUTADOR INTEIRO (qualquer pasta/arquivo do Windows) e pod
 - criar/editar QUALQUER tipo de arquivo de texto (código, config, .md, .json, .html, etc.),
 - executar comandos PowerShell.
 
-Sobre caminhos:
-- Use caminhos ABSOLUTOS do Windows para acessar qualquer lugar do PC (ex.: C:\Users\<voce>\Desktop\arquivo.txt). Descubra pastas com comandos: $env:USERPROFILE, [Environment]::GetFolderPath('Desktop'), Get-ChildItem.
-- Caminhos RELATIVOS são resolvidos dentro da PASTA DE TRABALHO (abaixo) — prefira-os só quando o usuário pedir para trabalhar DENTRO de uma pasta específica.
+Sobre pastas (NÃO existe pasta fixa de trabalho):
+- Você começa na PASTA ATUAL informada abaixo (a pasta pessoal do usuário), mas pode trabalhar em QUALQUER pasta do PC.
+- Quando o usuário CITAR uma pasta (ex.: "use a pasta Downloads", "no Desktop", "vá para C:\projetos"), MUDE para ela com action="change_dir" e path absoluto (ex.: C:\Users\<voce>\Downloads). A partir daí os caminhos relativos resolvem lá.
+- Você também pode usar caminhos ABSOLUTOS direto a qualquer momento, sem mudar de pasta.
+- Descubra pastas com comandos: $env:USERPROFILE, [Environment]::GetFolderPath('Desktop'), Get-ChildItem.
 
 Para CADA passo responda SOMENTE com um objeto JSON:
 - "explanation": em português, 1-2 frases, o que fará neste passo (ou o resumo final).
-- "action": "read_file" | "write_file" | "run" | "finish".
-- "path": caminho RELATIVO à pasta de trabalho (para read_file e write_file).
+- "action": "read_file" | "write_file" | "run" | "change_dir" | "finish".
+- "path": caminho do arquivo (read_file/write_file) ou da pasta (change_dir). Relativo resolve na pasta atual; absoluto vai direto.
 - "content": o conteúdo COMPLETO e final do arquivo (apenas para write_file; sobrescreve o arquivo inteiro — NÃO use diffs/trechos).
 - "powershell": o comando (apenas para action="run").
 - "task_complete": true quando a tarefa inteira terminou.
@@ -156,7 +162,11 @@ impl App {
         let memory = load_memory(&mem_path);
         let next_mem_id = memory.iter().map(|m| m.id).max().unwrap_or(0);
         let project_root = find_project_root();
-        let work_dir = project_root.to_string_lossy().to_string();
+        // Pasta inicial = pasta pessoal do usuário (sem conceito fixo de "pasta de trabalho").
+        let work_dir = std::env::var("USERPROFILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| project_root.to_string_lossy().to_string());
         Self {
             mode: Mode::Chat,
             input: String::new(),
@@ -270,7 +280,7 @@ impl App {
             Mode::Agent => {
                 let work_dir = std::path::PathBuf::from(self.work_dir.trim());
                 let system = format!(
-                    "{AGENT_SYSTEM}\n\nPASTA DE TRABALHO: {}\n{}",
+                    "{AGENT_SYSTEM}\n\nPASTA ATUAL: {}\n{}",
                     work_dir.display(),
                     self.memory_preamble()
                 );
@@ -394,31 +404,22 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.auto_run, "Executar automaticamente");
                     ui.label(
-                        egui::RichText::new("⚠ roda comandos/edições REAIS")
+                        egui::RichText::new("⚠ roda comandos/edições REAIS · acesso a todo o PC")
                             .small()
                             .color(egui::Color32::from_rgb(220, 160, 60)),
                     );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Pasta:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.work_dir)
-                            .desired_width(330.0)
-                            .hint_text("pasta onde o agente trabalha"),
-                    );
-                    if ui.button("📁").on_hover_text("Escolher pasta").clicked() {
-                        spawn_folder_picker(ctx.clone(), self.tx.clone(), self.work_dir.clone());
-                    }
-                    if ui
-                        .add_enabled(!self.pending, egui::Button::new("🔄 Auto-update Abyss"))
-                        .on_hover_text(
-                            "Salva no Git, edita uma cópia (updateabyss), compila e promove se passar.\n\
-                             Escreva no campo de baixo O QUE mudar e clique aqui.",
-                        )
-                        .clicked()
-                    {
-                        self.start_self_update(ctx);
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(!self.pending, egui::Button::new("🔄 Auto-update Abyss"))
+                            .on_hover_text(
+                                "Salva no Git, edita uma cópia (updateabyss), compila e promove se passar.\n\
+                                 Escreva no campo de baixo O QUE mudar e clique aqui.",
+                            )
+                            .clicked()
+                        {
+                            self.start_self_update(ctx);
+                        }
+                    });
                 });
             }
 
@@ -959,6 +960,7 @@ fn promote_tree(src: &std::path::Path, dst: &std::path::Path, count: &mut usize)
 fn build_dir(dir: &std::path::Path) -> (bool, String) {
     let out = std::process::Command::new("powershell")
         .current_dir(dir)
+        .creation_flags(CREATE_NO_WINDOW)
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1004,6 +1006,7 @@ fn run_powershell(script: &str, work_dir: &std::path::Path) -> String {
         "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script}"
     );
     let mut cmd = std::process::Command::new("powershell");
+    cmd.creation_flags(CREATE_NO_WINDOW); // roda em segundo plano, sem janela de console
     cmd.args([
         "-NoProfile",
         "-NonInteractive",
@@ -1080,7 +1083,7 @@ fn run_agent_loop(
     models: &[String],
     system: &str,
     history: &mut Vec<(String, String)>,
-    work_dir: &std::path::Path,
+    work_dir: &mut std::path::PathBuf,
     auto_run: bool,
     max_steps: usize,
 ) -> bool {
@@ -1088,7 +1091,7 @@ fn run_agent_loop(
         "type": "object",
         "properties": {
             "explanation": { "type": "string" },
-            "action": { "type": "string", "enum": ["run", "write_file", "read_file", "finish"] },
+            "action": { "type": "string", "enum": ["run", "write_file", "read_file", "change_dir", "finish"] },
             "path": { "type": "string" },
             "content": { "type": "string" },
             "powershell": { "type": "string" },
@@ -1142,11 +1145,24 @@ fn run_agent_loop(
 
         let mut acted = false;
         match action.as_str() {
+            "change_dir" if !path.trim().is_empty() => {
+                acted = true;
+                *work_dir = resolve_path(work_dir.as_path(), &path);
+                let exists = work_dir.is_dir();
+                let msg = if exists {
+                    format!("📂 Pasta atual: {}", work_dir.display())
+                } else {
+                    format!("📂 Pasta atual: {} (ainda não existe)", work_dir.display())
+                };
+                let _ = tx.send(WorkerMsg::AgentCmd(msg.clone()));
+                ctx.request_repaint();
+                history.push(("user".into(), format!("{msg}. Caminhos relativos agora resolvem aqui. Próximo passo ou finalize.")));
+            }
             "write_file" if !path.trim().is_empty() => {
                 acted = true;
                 let _ = tx.send(WorkerMsg::AgentCmd(format!("✏ write_file  {path}  ({} bytes)", content.len())));
                 ctx.request_repaint();
-                let result = write_file_in(work_dir, &path, &content);
+                let result = write_file_in(work_dir.as_path(), &path, &content);
                 let _ = tx.send(WorkerMsg::AgentOut(result.clone()));
                 ctx.request_repaint();
                 history.push(("user".into(), format!("Resultado de write_file {path}: {result}. Próximo passo ou finalize.")));
@@ -1155,7 +1171,7 @@ fn run_agent_loop(
                 acted = true;
                 let _ = tx.send(WorkerMsg::AgentCmd(format!("📖 read_file  {path}")));
                 ctx.request_repaint();
-                let data = read_file_in(work_dir, &path);
+                let data = read_file_in(work_dir.as_path(), &path);
                 let _ = tx.send(WorkerMsg::AgentOut(truncate_str(&data, 3000)));
                 ctx.request_repaint();
                 history.push(("user".into(), format!("Conteúdo de {path}:\n{}", truncate_str(&data, 16000))));
@@ -1171,7 +1187,7 @@ fn run_agent_loop(
                     ctx.request_repaint();
                     return true;
                 }
-                let output = run_powershell(&ps, work_dir);
+                let output = run_powershell(&ps, work_dir.as_path());
                 let _ = tx.send(WorkerMsg::AgentOut(output.clone()));
                 ctx.request_repaint();
                 history.push(("user".into(), format!("Saída do comando:\n{output}\n\nPróximo passo ou finalize.")));
@@ -1198,9 +1214,12 @@ fn spawn_agent(
     auto_run: bool,
 ) {
     thread::spawn(move || {
+        let mut wd = work_dir;
         run_agent_loop(
-            &ctx, &tx, &http, &key, &models, &system, &mut history, &work_dir, auto_run, MAX_AGENT_STEPS,
+            &ctx, &tx, &http, &key, &models, &system, &mut history, &mut wd, auto_run, MAX_AGENT_STEPS,
         );
+        // Persiste a pasta atual (caso o agente tenha feito change_dir) para a próxima mensagem.
+        let _ = tx.send(WorkerMsg::WorkDir(wd.to_string_lossy().to_string()));
         let _ = tx.send(WorkerMsg::AgentDone(history));
         ctx.request_repaint();
     });
@@ -1275,13 +1294,14 @@ fn spawn_self_update(
 
         say("✍ O agente vai editar os arquivos na cópia…".into());
         let system = format!(
-            "{AGENT_SYSTEM}\n\nPASTA DE TRABALHO: {}\n{}",
+            "{AGENT_SYSTEM}\n\nPASTA ATUAL: {}\n{}",
             update_dir.display(),
             memory_block
         );
         let mut history: Vec<(String, String)> = vec![("user".to_string(), seed)];
+        let mut wd = update_dir.clone();
         let ok_loop = run_agent_loop(
-            &ctx, &tx, &http, &key, &models, &system, &mut history, &update_dir, true, 24,
+            &ctx, &tx, &http, &key, &models, &system, &mut history, &mut wd, true, 24,
         );
         if !ok_loop {
             say("Interrompido por erro de API. A pasta 'updateabyss' foi mantida para retomar depois.".into());
@@ -1313,28 +1333,6 @@ fn spawn_self_update(
 
         let _ = tx.send(WorkerMsg::AgentDone(history));
         ctx.request_repaint();
-    });
-}
-
-fn spawn_folder_picker(ctx: egui::Context, tx: mpsc::Sender<WorkerMsg>, start: String) {
-    thread::spawn(move || {
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             $f = New-Object System.Windows.Forms.FolderBrowserDialog; \
-             try {{ $f.SelectedPath = '{}' }} catch {{}}; \
-             if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Out.Write($f.SelectedPath) }}",
-            start.replace('\'', "''")
-        );
-        if let Ok(o) = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-STA", "-Command", &script])
-            .output()
-        {
-            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !p.is_empty() {
-                let _ = tx.send(WorkerMsg::WorkDir(p));
-                ctx.request_repaint();
-            }
-        }
     });
 }
 
