@@ -1,4 +1,4 @@
-# Abyss — Cliente Desktop Nativo para o Google Gemini
+# Abyss AI — Cliente Desktop Nativo para o Google Gemini
 
 Aplicativo desktop **nativo, leve e sem Chromium** para conversar com o Google Gemini.
 Dois modos:
@@ -148,7 +148,7 @@ O binário final fica em: `target\release\abyss.exe`.
 
 ## 6. Memória persistente (`abyss_memory.json`)
 
-O Abyss lembra de fatos e instruções suas entre sessões.
+O Abyss AI lembra de fatos e instruções suas entre sessões.
 
 - **Para salvar:** comece (ou termine) a mensagem com um gatilho, por exemplo
   **"salve isso na memória: …"**. Outros gatilhos aceitos: *salva/salvar na memória,
@@ -198,14 +198,14 @@ A cada passo o Gemini responde em JSON com uma **ação**:
 O app executa a ação, devolve o resultado ao modelo e ele decide o próximo passo (até 16 passos).
 Ex.: *"crie um index.html simples com um título Olá"*, *"abra o main.py e troque a porta 8000 por 9000"*.
 
-### 🔄 Auto-update Abyss (o agente edita o próprio código com segurança)
-Escreva no campo **o que** mudar no Abyss e clique em **🔄 Auto-update Abyss**. O fluxo:
+### 🔄 Auto-update Abyss AI (o agente edita o próprio código com segurança)
+Escreva no campo **o que** mudar no Abyss AI e clique em **🔄 Auto-update Abyss AI**. O fluxo:
 1. **Salva no Git** o projeto atual (`git add/commit/push`).
 2. **Copia** o projeto para `updateabyss/` (ignorando `.git`, `target`, `abyss_memory.json`).
 3. O **agente edita** os arquivos **dentro da cópia** (read_file/write_file).
 4. Roda **`cargo build`** na cópia.
 5. Se **compilar** → **promove** os arquivos novos para o projeto principal e mantém a cópia.
-   Depois é só **fechar o Abyss e rodar `run.bat`** para usar a versão nova.
+   Depois é só **fechar o Abyss AI e rodar `run.bat`** para usar a versão nova.
 6. Se **não compilar** → **não promove nada** e **mantém `updateabyss/`**. Clique de novo em
    🔄 (ou peça *"corrija os erros"*): como a cópia já existe, ele **retoma** dela, lê os erros do
    `cargo build` e continua iterando **até compilar** (build incremental, bem mais rápido).

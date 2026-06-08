@@ -1,6 +1,6 @@
-# Abyss — Guia completo de instalação e requisitos
+# Abyss AI — Guia completo de instalação e requisitos
 
-Tudo que precisa estar na máquina para **rodar** e para **compilar/desenvolver** o Abyss
+Tudo que precisa estar na máquina para **rodar** e para **compilar/desenvolver** o Abyss AI
 (cliente desktop nativo do Google Gemini, em Rust + egui — sem Chromium/Electron).
 
 ---
@@ -23,10 +23,10 @@ Passos:
    ```bat
    powershell -ExecutionPolicy Bypass -File scripts\criar_atalhos.ps1
    ```
-3. Abra pelo atalho **Abyss** (Área de Trabalho ou busca do Iniciar).
+3. Abra pelo atalho **Abyss AI** (Área de Trabalho ou busca do Iniciar).
 4. Em **⚙ Configurações**, cole sua **API Key**.
 
-> ⚠️ Para a função **🔄 Auto-update Abyss** (o agente editar o próprio código) funcionar,
+> ⚠️ Para a função **🔄 Auto-update Abyss AI** (o agente editar o próprio código) funcionar,
 > a máquina precisa do **toolchain de compilação** da seção B, porque o app roda `cargo build`.
 > O resto do app (Chat, Agente em outras pastas, memória) funciona só com o `.exe`.
 
@@ -85,14 +85,14 @@ Binário final: **`target\release\abyss.exe`**.
 | Chat / Agente / Memória | só `abyss.exe` + internet + API Key |
 | Modo Agente (comandos, abrir apps, Excel) | **PowerShell** (nativo do Windows) |
 | Editar arquivos numa pasta | nada extra (é feito pelo próprio app) |
-| **🔄 Auto-update Abyss** | **Rust (GNU) + GCC MinGW** (seção B) — o app roda `cargo build` |
+| **🔄 Auto-update Abyss AI** | **Rust (GNU) + GCC MinGW** (seção B) — o app roda `cargo build` |
 | Embutir ícone ao compilar | `windres.exe`/`ar.exe` do MinGW (já vêm com o gcc) |
 
 ---
 
 ## D) Modelos do Gemini (grátis)
 
-Na barra superior há o seletor **Gemini:**, dividido em dois grupos:
+Na barra superior há o seletor **Modelos:** (o motor Gemini por baixo), dividido em dois grupos:
 
 - **Flash — rápidos, cota maior:** `gemini-2.5-flash` (padrão), `gemini-2.5-flash-lite`,
   `gemini-2.0-flash`, `gemini-2.0-flash-lite`, `gemini-1.5-flash`, `gemini-1.5-flash-8b`.
@@ -116,7 +116,7 @@ Na barra superior há o seletor **Gemini:**, dividido em dois grupos:
 |---|---|
 | Memória | `abyss_memory.json` (ao lado do `.exe`) |
 | Cópia de auto-edição | `updateabyss/` (na raiz do projeto; ignorada pelo Git) |
-| Atalhos | Área de Trabalho e `Menu Iniciar\Programs\Abyss.lnk` |
+| Atalhos | Área de Trabalho e `Menu Iniciar\Programs\Abyss AI.lnk` |
 
 ---
 
@@ -126,4 +126,4 @@ Recriar a qualquer momento:
 ```bat
 powershell -ExecutionPolicy Bypass -File scripts\criar_atalhos.ps1
 ```
-Cria **Abyss** na Área de Trabalho e no Menu Iniciar (ícone próprio do app).
+Cria **Abyss AI** na Área de Trabalho e no Menu Iniciar (ícone próprio do app).

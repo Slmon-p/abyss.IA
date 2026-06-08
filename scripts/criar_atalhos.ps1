@@ -1,4 +1,4 @@
-# Cria atalhos do Abyss na Área de Trabalho e no Menu Iniciar.
+# Cria atalhos do Abyss AI na Área de Trabalho e no Menu Iniciar.
 # Uso:  powershell -ExecutionPolicy Bypass -File scripts\criar_atalhos.ps1
 
 $ErrorActionPreference = "Stop"
@@ -18,17 +18,17 @@ function New-AbyssShortcut($linkPath) {
     $s.TargetPath       = $exe
     $s.WorkingDirectory = $work
     $s.IconLocation     = "$ico,0"
-    $s.Description       = "Abyss - cliente desktop do Google Gemini"
+    $s.Description       = "Abyss AI - cliente desktop do Google Gemini"
     $s.Save()
     Write-Host "OK -> $linkPath" -ForegroundColor Green
 }
 
 # 1) Area de Trabalho
 $desktop = [Environment]::GetFolderPath('Desktop')
-New-AbyssShortcut (Join-Path $desktop "Abyss.lnk")
+New-AbyssShortcut (Join-Path $desktop "Abyss AI.lnk")
 
 # 2) Menu Iniciar (tela inicial / busca do Windows)
 $startMenu = [Environment]::GetFolderPath('Programs')
-New-AbyssShortcut (Join-Path $startMenu "Abyss.lnk")
+New-AbyssShortcut (Join-Path $startMenu "Abyss AI.lnk")
 
-Write-Host "`nAtalhos criados. Procure por 'Abyss' no Iniciar ou use o icone da Area de Trabalho." -ForegroundColor Cyan
+Write-Host "`nAtalhos criados. Procure por 'Abyss AI' no Iniciar ou use o icone da Area de Trabalho." -ForegroundColor Cyan
