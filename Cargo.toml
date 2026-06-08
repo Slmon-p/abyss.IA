@@ -18,6 +18,11 @@ native-tls = "0.2"
 serde_json = "1"
 # Decodifica o PNG do ícone da janela (só o decoder de PNG, para ficar leve).
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Base64 para anexar imagens (inline_data do Gemini / data-URL da Groq). Já estava na árvore (via ureq).
+base64 = "0.22"
+calamine = "0.35.0"
+pdf-extract = "0.10.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 # Embute o ícone no .exe (usa windres/ar do MinGW).

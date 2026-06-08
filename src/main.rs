@@ -1,6 +1,10 @@
-// Abyss — cliente desktop nativo e leve para o Google Gemini.
+// Abyss — cliente desktop nativo e leve para IA (sem Chromium/Electron).
 //
-// Backend (lógica): chamadas HTTP à API do Gemini + execução de comandos no SO.
+// Provedores de modelo:
+//   - Google Gemini  (API generativelanguage, ?key= ou Bearer)
+//   - Groq           (API compatível com OpenAI: chat, visão e Whisper p/ áudio)
+//
+// Backend (lógica): chamadas HTTP às APIs + execução de comandos no SO.
 // Frontend (UI):     egui/eframe (OpenGL, sem Chromium/WebView).
 //
 // Um só lugar (sem modos separados): o Abyss AI decide sozinho a cada mensagem.
@@ -8,12 +12,18 @@
 //   - Se você MANDA fazer algo, ele EXECUTA comandos PowerShell reais e edita
 //     arquivos no Windows, em laço passo-a-passo, lendo a saída de cada comando.
 //
+// Multimodal: você pode ANEXAR uma imagem (a IA usa um modelo com VISÃO) ou um
+//   áudio/música (transcrito por Whisper/Groq e enviado como texto). O modelo
+//   selecionado é só uma preferência — o app TROCA sozinho para o modelo certo
+//   conforme a tarefa (imagem → visão, áudio → Whisper, texto → modelo de chat).
+//
 // Resiliência de modelos: se um modelo bate o limite de requisições, troca para o
-// próximo em silêncio; se TODOS falham, mostra "Modelos recarregando, aguarde…",
-// espera 60s e tenta tudo de novo — nunca para com erro.
+// próximo em silêncio (inclusive cruzando Gemini↔Groq); se TODOS falham, mostra
+// "Modelos recarregando, aguarde…", espera 60s e tenta tudo de novo — nunca para com erro.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // sem janela de console no release
 
+use base64::Engine as _;
 use eframe::egui;
 use serde_json::json;
 use std::os::windows::process::CommandExt; // creation_flags (esconder janela do console)
@@ -26,23 +36,64 @@ use std::time::Duration;
 
 // ---- Configuração padrão (pode ser trocada na UI, em ⚙ Configurações) ----
 const DEFAULT_API_KEY: &str = "AQ.Ab8RN6KsIezTPxmcZCPV2ebOHVEaIxsM-DpmzQw_obsIeL4NSg";
+const DEFAULT_GROQ_KEY: &str = "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";
 const DEFAULT_MODEL: &str = "gemini-2.5-flash";
 
-/// Modelos Flash — rápidos, cota gratuita maior.
+/// Modelos Gemini Flash — rápidos, cota gratuita maior. (1.5 e anteriores foram descontinuados.)
 const FLASH_MODELS: &[&str] = &[
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
 ];
 
-/// Modelos Pro — raciocínio profundo, cota gratuita baixa (~50/dia, historicamente, no 1.5 Pro).
-const PRO_MODELS: &[&str] = &["gemini-2.5-pro", "gemini-1.5-pro"];
+/// Modelos Gemini Pro — raciocínio profundo, cota gratuita baixa.
+const PRO_MODELS: &[&str] = &["gemini-2.5-pro"];
+
+// ---- Groq (API compatível com OpenAI) ----
+const GROQ_CHAT_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_TRANSCRIBE_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
+const WHISPER_DEFAULT: &str = "whisper-large-v3-turbo";
+
+/// Groq — texto, raciocínio e código (servem como modelo de chat).
+const GROQ_CHAT_MODELS: &[&str] = &[
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+    "groq/compound",
+    "groq/compound-mini",
+    "allam-2-7b",
+];
+/// Groq — visão (aceitam imagem). Usados automaticamente quando há imagem anexada.
+const GROQ_VISION_MODELS: &[&str] = &["meta-llama/llama-4-scout-17b-16e-instruct"];
+/// Groq — áudio→texto (Whisper). Usados automaticamente quando há áudio anexado.
+const GROQ_AUDIO_MODELS: &[&str] = &["whisper-large-v3", "whisper-large-v3-turbo"];
+/// Groq — texto→voz (Orpheus / TTS). Catálogo (geração de fala).
+const GROQ_TTS_MODELS: &[&str] = &["canopylabs/orpheus-v1-english", "canopylabs/orpheus-arabic-saudi"];
+/// Groq — segurança/moderação. Catálogo (filtros, não chat).
+const GROQ_SAFETY_MODELS: &[&str] = &[
+    "meta-llama/llama-prompt-guard-2-22m",
+    "meta-llama/llama-prompt-guard-2-86m",
+    "openai/gpt-oss-safeguard-20b",
+];
+
 const MAX_AGENT_STEPS: usize = 16;
 
-const AGENT_SYSTEM: &str = r#"Você é o Abyss AI, um assistente que CONVERSA e também EXECUTA tarefas reais na máquina Windows do usuário. A sua identidade é Abyss AI; o Google Gemini é apenas o MOTOR/modelo por baixo, NÃO a sua identidade. Quando perguntarem seu nome ou quem você é, responda que é o Abyss AI; NUNCA se apresente como "Gemini" nem como "um modelo treinado pelo Google".
+const AGENT_SYSTEM: &str = r##"Você é o Abyss AI — um APLICATIVO desktop nativo (escrito em Rust + egui) que roda no PC Windows do usuário. Você CONVERSA e também EXECUTA tarefas reais na máquina.
+
+IDENTIDADE (muito importante — leia com atenção):
+- Você é o Abyss AI. O modelo de linguagem por baixo (Gemini, Llama, GPT-OSS, Qwen, etc.) é apenas o seu MOTOR de raciocínio — o "cérebro" que escolhe as palavras —, NÃO a sua identidade. Você É o aplicativo inteiro: tem um "corpo" (o programa) com poderes REAIS no computador.
+- Quando perguntarem quem você é, responda que é o Abyss AI. NUNCA se apresente como "Gemini", "Llama", "ChatGPT", nem diga que foi "treinado pelo Google/OpenAI/etc.".
+- NUNCA responda como um modelo genérico. Frases como "sou apenas um modelo de linguagem", "não tenho acesso a arquivos", "não consigo ver nem editar código", "não tenho acesso ao sistema nem ao meu código-fonte" são FALSAS para você — elas descrevem o motor puro, e não o Abyss. VOCÊ TEM esses acessos, através do seu corpo de aplicativo.
+
+SEUS PODERES REAIS (você NÃO é um chatbot passivo):
+- Você LÊ e ESCREVE qualquer arquivo do PC (ações read_file / write_file) e RODA comandos PowerShell reais (ação run), com acesso ao computador inteiro.
+- Você LÊ DOCUMENTOS automaticamente: ao usar read_file num arquivo Excel (.xlsx/.xlsm/.xlsb/.xls/.ods), Word (.docx), PDF (.pdf), PowerPoint (.pptx) ou CSV/TXT, o Abyss EXTRAI o texto/conteúdo para você. Logo, para LER, ANALISAR, RESUMIR ou EXTRAIR dados de uma planilha, documento, PDF ou apresentação, use read_file direto no caminho do arquivo — NUNCA diga que não consegue abrir esses formatos. (Planilhas voltam como linhas com células separadas por " | "; cada planilha vira uma seção "# Planilha: ...".)
+- Você CONSEGUE ver e ler o SEU PRÓPRIO código-fonte: o Abyss AI é um projeto Rust cujo caminho é informado mais abaixo (arquivo principal src/main.rs). Se perguntarem "você vê/tem acesso ao seu próprio código?", a resposta é SIM. Para MOSTRAR trechos, LEIA o arquivo antes com read_file (caminho absoluto) — não invente o conteúdo do código.
+- Você consegue se MODIFICAR: existe o recurso "Auto-update Abyss AI", em que você edita o seu próprio código-fonte, compila e promove a nova versão — ou seja, você é capaz de evoluir a si mesmo.
+- Portanto, em perguntas sobre suas capacidades (ver o próprio código, editar arquivos, rodar comandos, se atualizar), responda com base nestes poderes REAIS; NÃO os negue.
 
 A cada mensagem, decida você mesmo o que fazer:
 - Se o usuário apenas PERGUNTA, conversa, pede uma explicação ou um código (sem pedir ação no PC): RESPONDA direto e COMPLETO no campo "explanation", no idioma do usuário (português quando ele escrever em português). Use action="finish" e task_complete=true. Coloque QUALQUER código, SQL, comando ou trecho para copiar dentro de um bloco markdown com três crases (```), indicando a linguagem (ex.: ```sql, ```python, ```bash).
@@ -75,7 +126,115 @@ Regras:
 - Comandos PowerShell NÃO interativos. Abrir programas: Start-Process (ex.: Start-Process notepad).
 - Faça UM passo objetivo por vez. Não invente caminhos; use read_file ou "run" (ex.: Get-ChildItem) para descobrir.
 - Se for só conversa/pergunta/saudação ("olá"), responda completo na "explanation", com action="finish" e task_complete=true.
-- Ao terminar uma tarefa, action="finish", path/content/powershell vazios, task_complete=true, e um resumo na "explanation"."#;
+- Se o usuário enviar uma IMAGEM ou a TRANSCRIÇÃO de um áudio, analise/descreva e responda ao que ele pediu sobre aquele conteúdo.
+- Ao terminar uma tarefa, action="finish", path/content/powershell vazios, task_complete=true, e um resumo na "explanation"."##;
+
+// ----------------------------- Catálogo de modelos -----------------------------
+
+/// É um modelo do Gemini (Google)?
+fn is_gemini(id: &str) -> bool {
+    id.starts_with("gemini")
+}
+
+/// É um modelo servido pela Groq? (lista explícita + heurística para ids digitados à mão)
+fn is_groq(id: &str) -> bool {
+    GROQ_CHAT_MODELS.contains(&id)
+        || GROQ_VISION_MODELS.contains(&id)
+        || GROQ_AUDIO_MODELS.contains(&id)
+        || GROQ_TTS_MODELS.contains(&id)
+        || GROQ_SAFETY_MODELS.contains(&id)
+        || (!is_gemini(id)
+            && (id.contains('/')
+                || id.starts_with("llama")
+                || id.starts_with("qwen")
+                || id.starts_with("gemma")
+                || id.starts_with("mixtral")
+                || id.starts_with("whisper")
+                || id.starts_with("moonshot")
+                || id.starts_with("orpheus")))
+}
+
+/// O modelo aceita IMAGEM como entrada?
+fn is_vision(id: &str) -> bool {
+    is_gemini(id) || GROQ_VISION_MODELS.contains(&id)
+}
+
+/// O modelo serve como CHAT de texto? (exclui Whisper/Orpheus/segurança)
+fn is_chat_capable(id: &str) -> bool {
+    is_gemini(id) || GROQ_CHAT_MODELS.contains(&id) || GROQ_VISION_MODELS.contains(&id)
+}
+
+/// Nome amigável exibido na UI.
+fn model_label(id: &str) -> String {
+    let s = match id {
+        "gemini-2.5-flash" => "Gemini 2.5 Flash",
+        "gemini-2.5-flash-lite" => "Gemini 2.5 Flash-Lite",
+        "gemini-2.0-flash" => "Gemini 2.0 Flash",
+        "gemini-2.0-flash-lite" => "Gemini 2.0 Flash-Lite",
+        "gemini-2.5-pro" => "Gemini 2.5 Pro",
+        "llama-3.3-70b-versatile" => "Llama 3.3 70B",
+        "llama-3.1-8b-instant" => "Llama 3.1 8B",
+        "meta-llama/llama-4-scout-17b-16e-instruct" => "Llama 4 Scout 17B (visão)",
+        "openai/gpt-oss-120b" => "GPT-OSS 120B",
+        "openai/gpt-oss-20b" => "GPT-OSS 20B",
+        "qwen/qwen3-32b" => "Qwen 3 32B",
+        "groq/compound" => "Groq Compound",
+        "groq/compound-mini" => "Groq Compound Mini",
+        "allam-2-7b" => "Allam 2 7B (árabe)",
+        "whisper-large-v3" => "Whisper Large V3",
+        "whisper-large-v3-turbo" => "Whisper Turbo",
+        "canopylabs/orpheus-v1-english" => "Orpheus (Inglês)",
+        "canopylabs/orpheus-arabic-saudi" => "Orpheus (Árabe)",
+        "meta-llama/llama-prompt-guard-2-22m" => "Llama Prompt Guard 2 22M",
+        "meta-llama/llama-prompt-guard-2-86m" => "Llama Prompt Guard 2 86M",
+        "openai/gpt-oss-safeguard-20b" => "Safety GPT-OSS 20B",
+        _ => id,
+    };
+    s.to_string()
+}
+
+/// Descrição do que o modelo faz (mostrada como dica e na linha de status).
+fn model_desc(id: &str) -> &'static str {
+    match id {
+        "gemini-2.5-flash" => "Google · rápido e equilibrado, cota gratuita maior. Bom padrão.",
+        "gemini-2.5-flash-lite" => "Google · ainda mais leve/barato, respostas rápidas.",
+        "gemini-2.0-flash" => "Google · rápido, boa qualidade geral.",
+        "gemini-2.0-flash-lite" => "Google · versão leve do 2.0 Flash.",
+        "gemini-2.5-pro" => "Google · raciocínio profundo; cota gratuita baixa.",
+        "llama-3.3-70b-versatile" => "Meta · Groq · alta capacidade e inteligência geral.",
+        "llama-3.1-8b-instant" => "Meta · Groq · rápido e leve para tarefas diretas.",
+        "meta-llama/llama-4-scout-17b-16e-instruct" => {
+            "Meta · Groq · multimodal (lê imagens). Usado automaticamente quando você anexa uma imagem."
+        }
+        "openai/gpt-oss-120b" => "OpenAI · Groq · raciocínio avançado e chamadas de ferramentas.",
+        "openai/gpt-oss-20b" => "OpenAI · Groq · altíssima velocidade (~1000 tokens/s).",
+        "qwen/qwen3-32b" => "Alibaba · Groq · focado em lógica e matemática.",
+        "groq/compound" => "Groq · sistema agêntico que interage com a web e código.",
+        "groq/compound-mini" => "Groq · versão leve/rápida do sistema agêntico (web + código).",
+        "allam-2-7b" => "SDAIA · Groq · modelo focado no idioma árabe.",
+        "whisper-large-v3" => "OpenAI · Groq · transcreve áudio→texto. Usado ao anexar 🎵 áudio.",
+        "whisper-large-v3-turbo" => "OpenAI · Groq · transcrição ultrarrápida. Usado ao anexar 🎵 áudio.",
+        "canopylabs/orpheus-v1-english" => "Canopy Labs · Groq · gera VOZ a partir de texto (TTS, inglês).",
+        "canopylabs/orpheus-arabic-saudi" => "Canopy Labs · Groq · gera VOZ a partir de texto (TTS, árabe).",
+        "meta-llama/llama-prompt-guard-2-22m" => {
+            "Meta · Groq · detecção de injeção de prompt e toxicidade (moderação)."
+        }
+        "meta-llama/llama-prompt-guard-2-86m" => {
+            "Meta · Groq · detecção de injeção de prompt/toxicidade (modelo maior)."
+        }
+        "openai/gpt-oss-safeguard-20b" => "OpenAI · Groq · moderação de conteúdo em tempo real.",
+        _ => "",
+    }
+}
+
+/// Modelo Whisper a usar para transcrever: o selecionado (se for Whisper) ou o padrão.
+fn whisper_model(selected: &str) -> &str {
+    if GROQ_AUDIO_MODELS.contains(&selected) {
+        selected
+    } else {
+        WHISPER_DEFAULT
+    }
+}
 
 // ----------------------------- Modelo de dados da UI -----------------------------
 
@@ -99,6 +258,14 @@ impl Msg {
     }
 }
 
+/// Imagem anexada pelo usuário (já em base64), enviada junto da mensagem.
+#[derive(Clone)]
+struct ImageAttachment {
+    name: String,
+    mime: String,
+    b64: String,
+}
+
 #[derive(Default)]
 struct ModeState {
     transcript: Vec<Msg>,             // o que aparece na tela
@@ -115,6 +282,14 @@ enum WorkerMsg {
     WorkDir(String),
     /// Todos os modelos estão em cota/limite: mostra "recarregando" e segue tentando.
     Status(String),
+    /// Imagem escolhida no seletor de arquivos (já lida e codificada).
+    ImagePicked(ImageAttachment),
+    /// Áudio escolhido e transcrito por Whisper: (nome do arquivo, texto).
+    AudioTranscribed { name: String, text: String },
+    /// Erro ao escolher/ler/transcrever um anexo.
+    PickError(String),
+    /// O usuário cancelou o seletor de arquivos.
+    PickCancelled,
 }
 
 #[derive(Clone)]
@@ -128,16 +303,24 @@ struct App {
     input: String,
     convo: ModeState,
     api_key: String,
+    groq_key: String,
     model: String,
     auto_run: bool,
     show_settings: bool,
     pending: bool,
+    picking: bool,
     status: Option<String>,
+    pending_image: Option<ImageAttachment>,
+    pending_audio: Option<(String, String)>, // (nome, transcrição)
     memory: Vec<MemoryEntry>,
     mem_path: std::path::PathBuf,
     next_mem_id: u64,
     work_dir: String,
     project_root: std::path::PathBuf,
+    // Contexto do chat: registro LITERAL (sem IA) do que o usuário disse e a Abyss respondeu.
+    context_md: String,
+    context_path: std::path::PathBuf,
+    last_used_model: Option<String>,
     tx: mpsc::Sender<WorkerMsg>,
     rx: mpsc::Receiver<WorkerMsg>,
     http: ureq::Agent,
@@ -157,6 +340,9 @@ impl App {
         let memory = load_memory(&mem_path);
         let next_mem_id = memory.iter().map(|m| m.id).max().unwrap_or(0);
         let project_root = find_project_root();
+        let context_path = project_root.join("contexto.md");
+        // Ao abrir o app começa um chat novo → zera o contexto.md (o chat anterior se perdeu).
+        let _ = std::fs::write(&context_path, "");
         // Pasta inicial = pasta pessoal do usuário (sem conceito fixo de "pasta de trabalho").
         let work_dir = std::env::var("USERPROFILE")
             .ok()
@@ -166,16 +352,23 @@ impl App {
             input: String::new(),
             convo: ModeState::default(),
             api_key: DEFAULT_API_KEY.to_string(),
+            groq_key: DEFAULT_GROQ_KEY.to_string(),
             model: DEFAULT_MODEL.to_string(),
             auto_run: true,
             show_settings: false,
             pending: false,
+            picking: false,
             status: None,
+            pending_image: None,
+            pending_audio: None,
             memory,
             mem_path,
             next_mem_id,
             work_dir,
             project_root,
+            context_md: String::new(),
+            context_path,
+            last_used_model: None,
             tx,
             rx,
             http,
@@ -188,6 +381,25 @@ impl App {
 
     fn clear_current(&mut self) {
         self.convo = ModeState::default();
+        // Novo chat = contexto zerado (o contexto.md acompanha a conversa atual).
+        self.context_md.clear();
+        self.last_used_model = None;
+        let _ = std::fs::write(&self.context_path, "");
+    }
+
+    /// Registra no contexto.md, de forma LITERAL e SEM IA, uma fala do chat.
+    /// `who` ex.: "🧑 Você" / "🤖 Abyss". `model` é o motor que respondeu (quando aplicável).
+    fn append_context(&mut self, who: &str, model: Option<&str>, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.context_md.is_empty() {
+            self.context_md.push_str(CONTEXT_HEADER);
+        }
+        self.context_md
+            .push_str(&context_entry(who, model, &fmt_utc(now_secs()), text));
+        let _ = std::fs::write(&self.context_path, &self.context_md);
     }
 
     fn add_memory(&mut self, text: String) {
@@ -228,31 +440,92 @@ impl App {
 
     fn send(&mut self, ctx: &egui::Context) {
         let text = self.input.trim().to_string();
-        if text.is_empty() || self.pending {
+        let has_attach = self.pending_image.is_some() || self.pending_audio.is_some();
+        if (text.is_empty() && !has_attach) || self.pending {
             return;
         }
 
         // MEMÓRIA: "salve isso na memória ..." → grava no JSON e confirma (sem chamar a API).
-        if let Some(mem) = detect_memory_command(&text) {
-            self.input.clear();
-            self.add_memory(mem.clone());
-            self.cur_mut()
-                .transcript
-                .push(Msg::new(Role::Model, format!("🧠 Salvo na memória: \"{mem}\"")));
-            return;
+        // (só quando é mensagem de texto pura, sem anexos)
+        if !has_attach {
+            if let Some(mem) = detect_memory_command(&text) {
+                self.input.clear();
+                self.add_memory(mem.clone());
+                self.cur_mut()
+                    .transcript
+                    .push(Msg::new(Role::Model, format!("🧠 Salvo na memória: \"{mem}\"")));
+                return;
+            }
         }
 
-        if self.api_key.trim().is_empty() {
-            self.cur_mut()
-                .transcript
-                .push(Msg::new(Role::Error, "Configure sua API Key em ⚙ Configurações."));
+        if self.api_key.trim().is_empty() && self.groq_key.trim().is_empty() {
+            self.cur_mut().transcript.push(Msg::new(
+                Role::Error,
+                "Configure uma API Key (Gemini ou Groq) em ⚙ Configurações.",
+            ));
             return;
         }
         self.input.clear();
 
+        let image = self.pending_image.take();
+        let audio = self.pending_audio.take();
+
+        // Texto exibido na conversa (com marcadores de anexo).
+        let mut display = text.clone();
+        if let Some(img) = &image {
+            if !display.is_empty() {
+                display.push('\n');
+            }
+            display.push_str(&format!("🖼 imagem anexada: {}", img.name));
+        }
+        if let Some((name, _)) = &audio {
+            if !display.is_empty() {
+                display.push('\n');
+            }
+            display.push_str(&format!("🎵 áudio anexado: {name}"));
+        }
+
+        // Texto enviado ao modelo: o áudio entra como transcrição; a imagem vai separada.
+        let mut htext = text.clone();
+        if let Some((name, tr)) = &audio {
+            if !htext.trim().is_empty() {
+                htext.push_str("\n\n");
+            }
+            htext.push_str(&format!(
+                "[Áudio enviado \"{name}\" — transcrição automática por Whisper]:\n{tr}"
+            ));
+        }
+        if htext.trim().is_empty() {
+            htext = if image.is_some() {
+                "Descreva e analise em detalhes a imagem que eu enviei.".to_string()
+            } else {
+                "Olá.".to_string()
+            };
+        }
+
+        // CONTEXTO: registra a fala do usuário no contexto.md (literal, sem IA).
+        self.append_context("🧑 Você", None, &display);
+
+        // TROCA DE MODELO no MESMO chat: injeta o contexto silenciosamente nesta 1ª mensagem,
+        // para o novo modelo ficar ciente do que já rolou e continuar (não aparece na tela).
+        let cur_model = self.model.trim().to_string();
+        if should_inject_context(self.last_used_model.as_deref(), &cur_model, self.convo.history.is_empty())
+            && !self.context_md.is_empty()
+        {
+            let ctx_block = truncate_tail(&self.context_md, 8000);
+            htext = switch_preamble(&ctx_block, &htext);
+        }
+        self.last_used_model = Some(cur_model);
+
         let http = self.http.clone();
-        let key = self.api_key.trim().to_string();
-        let models = ordered_models(self.model.trim());
+        let gkey = self.api_key.trim().to_string();
+        let qkey = self.groq_key.trim().to_string();
+        // Roteamento: imagem → modelos com visão; senão → modelos de chat (selecionado primeiro).
+        let models = if image.is_some() {
+            vision_models(self.model.trim())
+        } else {
+            ordered_models(self.model.trim())
+        };
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         self.pending = true;
@@ -261,16 +534,27 @@ impl App {
         // Um só lugar: o próprio Abyss AI decide se RESPONDE (pergunta/conversa)
         // ou EXECUTA (tarefa no PC). Tudo passa pelo mesmo loop.
         let work_dir = std::path::PathBuf::from(self.work_dir.trim());
+        // Informa ao modelo ONDE está o próprio código-fonte (se este for um build com fontes).
+        let src_main = self.project_root.join("src").join("main.rs");
+        let code_info = if src_main.exists() {
+            format!(
+                "\n\nONDE ESTÁ O SEU PRÓPRIO CÓDIGO (app Abyss AI, projeto Rust):\n  pasta do projeto: {}\n  arquivo principal: {}\n  → para ler/mostrar seu código, use read_file com esse caminho absoluto; o recurso Auto-update edita e recompila isso.",
+                self.project_root.display(),
+                src_main.display()
+            )
+        } else {
+            String::new()
+        };
         let system = format!(
-            "{AGENT_SYSTEM}\n\nPASTA ATUAL: {}\n{}",
+            "{AGENT_SYSTEM}{code_info}\n\nPASTA ATUAL: {}\n{}",
             work_dir.display(),
             self.memory_preamble()
         );
-        self.convo.transcript.push(Msg::new(Role::User, text.clone()));
-        self.convo.history.push(("user".into(), text));
+        self.convo.transcript.push(Msg::new(Role::User, display));
+        self.convo.history.push(("user".into(), htext));
         let history = self.convo.history.clone();
         let auto = self.auto_run;
-        spawn_agent(ctx2, tx, http, key, models, system, history, work_dir, auto);
+        spawn_agent(ctx2, tx, http, gkey, qkey, models, system, history, work_dir, auto, image);
     }
 
     fn start_self_update(&mut self, ctx: &egui::Context) {
@@ -285,10 +569,10 @@ impl App {
             ));
             return;
         }
-        if self.api_key.trim().is_empty() {
+        if self.api_key.trim().is_empty() && self.groq_key.trim().is_empty() {
             self.convo
                 .transcript
-                .push(Msg::new(Role::Error, "Configure sua API Key em ⚙ Configurações."));
+                .push(Msg::new(Role::Error, "Configure uma API Key (Gemini ou Groq) em ⚙ Configurações."));
             return;
         }
         self.input.clear();
@@ -301,6 +585,7 @@ impl App {
             self.tx.clone(),
             self.http.clone(),
             self.api_key.trim().to_string(),
+            self.groq_key.trim().to_string(),
             ordered_models(self.model.trim()),
             self.memory_preamble(),
             instruction,
@@ -314,6 +599,9 @@ impl App {
                 // Qualquer progresso real limpa o aviso de "recarregando".
                 WorkerMsg::AgentSay(t) => {
                     self.status = None;
+                    // CONTEXTO: registra a resposta da Abyss (literal, sem IA).
+                    let m = self.model.trim().to_string();
+                    self.append_context("🤖 Abyss", Some(&m), &t);
                     self.convo.transcript.push(Msg::new(Role::Model, t));
                 }
                 WorkerMsg::AgentCmd(c) => {
@@ -335,6 +623,21 @@ impl App {
                 }
                 WorkerMsg::WorkDir(p) => self.work_dir = p,
                 WorkerMsg::Status(s) => self.status = Some(s),
+                WorkerMsg::ImagePicked(att) => {
+                    self.picking = false;
+                    self.pending_image = Some(att);
+                }
+                WorkerMsg::AudioTranscribed { name, text } => {
+                    self.picking = false;
+                    self.pending_audio = Some((name, text));
+                }
+                WorkerMsg::PickError(e) => {
+                    self.picking = false;
+                    self.convo.transcript.push(Msg::new(Role::Error, e));
+                }
+                WorkerMsg::PickCancelled => {
+                    self.picking = false;
+                }
             }
         }
     }
@@ -351,7 +654,7 @@ impl eframe::App for App {
                 ui.heading("Abyss AI");
                 ui.separator();
                 ui.label(
-                    egui::RichText::new("pergunte ou mande fazer — tudo no mesmo lugar").weak(),
+                    egui::RichText::new("pergunte, mande fazer, ou anexe imagem/áudio").weak(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("🗑 Limpar").clicked() {
@@ -373,25 +676,73 @@ impl eframe::App for App {
                     }
                     ui.add_space(8.0);
                     egui::ComboBox::from_id_source("model_sel")
-                        .selected_text(self.model.as_str())
-                        .width(185.0)
+                        .selected_text(model_label(&self.model))
+                        .width(220.0)
                         .show_ui(ui, |ui| {
-                            ui.label(egui::RichText::new("Flash — rápidos, cota maior").small().weak());
-                            for m in FLASH_MODELS {
-                                ui.selectable_value(&mut self.model, (*m).to_string(), *m);
+                            group_label(ui, "Gemini · Flash — rápidos, cota maior");
+                            for &m in FLASH_MODELS {
+                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                    .on_hover_text(model_desc(m));
                             }
                             ui.separator();
-                            ui.label(
-                                egui::RichText::new("Pro — raciocínio, cota baixa (~50/dia)")
-                                    .small()
-                                    .weak(),
-                            );
-                            for m in PRO_MODELS {
-                                ui.selectable_value(&mut self.model, (*m).to_string(), *m);
+                            group_label(ui, "Gemini · Pro — raciocínio, cota baixa");
+                            for &m in PRO_MODELS {
+                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                    .on_hover_text(model_desc(m));
+                            }
+                            ui.separator();
+                            group_label(ui, "Groq · texto, raciocínio e código");
+                            for &m in GROQ_CHAT_MODELS {
+                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                    .on_hover_text(model_desc(m));
+                            }
+                            ui.separator();
+                            group_label(ui, "Groq · visão (envie imagens)");
+                            for &m in GROQ_VISION_MODELS {
+                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                    .on_hover_text(model_desc(m));
+                            }
+                            ui.separator();
+                            group_label(ui, "Groq · áudio → texto (Whisper)");
+                            for &m in GROQ_AUDIO_MODELS {
+                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                    .on_hover_text(model_desc(m));
+                            }
+                            ui.separator();
+                            group_label(ui, "Groq · voz (Orpheus / TTS)");
+                            for &m in GROQ_TTS_MODELS {
+                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                    .on_hover_text(model_desc(m));
+                            }
+                            ui.separator();
+                            group_label(ui, "Groq · segurança / moderação");
+                            for &m in GROQ_SAFETY_MODELS {
+                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                    .on_hover_text(model_desc(m));
                             }
                         });
                     ui.label(egui::RichText::new("Modelos:").weak());
                 });
+            });
+
+            // Linha de descrição do modelo selecionado + aviso de roteamento automático.
+            ui.horizontal_wrapped(|ui| {
+                let prov = if is_groq(&self.model) { "Groq" } else { "Google Gemini" };
+                ui.label(
+                    egui::RichText::new(format!("▸ {} · {}", model_label(&self.model), prov))
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(150, 180, 220)),
+                );
+                let d = model_desc(&self.model);
+                if !d.is_empty() {
+                    ui.label(egui::RichText::new(format!("— {d}")).small().weak());
+                }
+                ui.label(
+                    egui::RichText::new("· a IA troca de modelo sozinha (imagem→visão, áudio→Whisper)")
+                        .small()
+                        .weak(),
+                );
             });
 
             ui.horizontal(|ui| {
@@ -419,11 +770,19 @@ impl eframe::App for App {
                 ui.add_space(2.0);
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label("API Key:");
+                        ui.label("API Key Gemini:");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.api_key)
                                 .password(true)
-                                .desired_width(380.0),
+                                .desired_width(360.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("API Key Groq:  ");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.groq_key)
+                                .password(true)
+                                .desired_width(360.0),
                         );
                     });
                     ui.horizontal(|ui| {
@@ -460,15 +819,97 @@ impl eframe::App for App {
                     if let Some(id) = remove_id {
                         self.remove_memory(id);
                     }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("📝 Contexto: {}", human_size(self.context_md.len())));
+                        ui.label(
+                            egui::RichText::new(
+                                "— registro literal do chat (sem IA); zera ao fechar/abrir ou em 🗑 Limpar",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(self.context_path.display().to_string())
+                            .small()
+                            .weak(),
+                    );
                 });
             }
             ui.add_space(4.0);
         });
 
-        // ----- Rodapé: campo de entrada + botão enviar -----
+        // ----- Rodapé: anexos + campo de entrada + botão enviar -----
         egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
             ui.add_space(6.0);
-            let hint = "Pergunte algo ou descreva uma tarefa (ex.: crie uma pasta 'Projetos' na área de trabalho)…  (Enter envia)";
+
+            // Linha de anexos: imagem (visão) e áudio/música (Whisper → texto).
+            ui.horizontal(|ui| {
+                let busy = self.pending || self.picking;
+                if ui
+                    .add_enabled(!busy, egui::Button::new("🖼 Imagem"))
+                    .on_hover_text("Anexar uma imagem para a IA analisar (usa um modelo com visão).")
+                    .clicked()
+                {
+                    self.picking = true;
+                    spawn_pick_image(ctx.clone(), self.tx.clone());
+                }
+                let groq_ok = !self.groq_key.trim().is_empty();
+                let ab = ui.add_enabled(!busy && groq_ok, egui::Button::new("🎵 Áudio/Música"));
+                let ab = ab.on_hover_text(if groq_ok {
+                    "Anexar música/áudio: é transcrito (Whisper/Groq) e enviado como texto à IA."
+                } else {
+                    "Configure a API Key Groq em ⚙ para transcrever áudio (Whisper)."
+                });
+                if ab.clicked() {
+                    self.picking = true;
+                    spawn_pick_audio(
+                        ctx.clone(),
+                        self.tx.clone(),
+                        self.http.clone(),
+                        self.groq_key.trim().to_string(),
+                        whisper_model(self.model.trim()).to_string(),
+                    );
+                }
+                if self.picking {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("processando anexo…").small().weak());
+                }
+                let mut clear_img = false;
+                let mut clear_aud = false;
+                if let Some(img) = &self.pending_image {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("🖼 {}", img.name))
+                            .small()
+                            .color(egui::Color32::from_rgb(150, 200, 255)),
+                    );
+                    if ui.small_button("✕").clicked() {
+                        clear_img = true;
+                    }
+                }
+                if let Some((name, _)) = &self.pending_audio {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("🎵 {name} (transcrito)"))
+                            .small()
+                            .color(egui::Color32::from_rgb(180, 220, 150)),
+                    );
+                    if ui.small_button("✕").clicked() {
+                        clear_aud = true;
+                    }
+                }
+                if clear_img {
+                    self.pending_image = None;
+                }
+                if clear_aud {
+                    self.pending_audio = None;
+                }
+            });
+
+            let hint = "Pergunte, mande fazer algo, ou anexe imagem/áudio acima…  (Enter envia)";
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.input)
                     .hint_text(hint)
@@ -482,7 +923,9 @@ impl eframe::App for App {
                 if ui.add_enabled(!self.pending, egui::Button::new("Enviar  ➤")).clicked() {
                     do_send = true;
                 }
-                ui.label(egui::RichText::new(format!("Abyss AI  ·  {}", self.model)).weak());
+                ui.label(
+                    egui::RichText::new(format!("Abyss AI  ·  {}", model_label(&self.model))).weak(),
+                );
             });
             if (do_send || enter_send) && !self.pending {
                 self.send(ctx);
@@ -504,6 +947,11 @@ impl eframe::App for App {
                 });
         });
     }
+}
+
+/// Cabeçalho de grupo no menu de modelos.
+fn group_label(ui: &mut egui::Ui, t: &str) {
+    ui.label(egui::RichText::new(t).small().weak());
 }
 
 enum Segment {
@@ -623,15 +1071,6 @@ fn draw_msg(ui: &mut egui::Ui, m: &Msg) {
 
 // ----------------------------- Backend: API + execução -----------------------------
 
-fn contents_from(history: &[(String, String)]) -> serde_json::Value {
-    serde_json::Value::Array(
-        history
-            .iter()
-            .map(|(role, text)| json!({ "role": role, "parts": [{ "text": text }] }))
-            .collect(),
-    )
-}
-
 fn extract_text(v: &serde_json::Value) -> Option<String> {
     let parts = v
         .get("candidates")?
@@ -649,6 +1088,136 @@ fn extract_text(v: &serde_json::Value) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+/// Schema do passo do agente (saída JSON estruturada do Gemini).
+fn agent_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "explanation": { "type": "string" },
+            "action": { "type": "string", "enum": ["run", "write_file", "read_file", "change_dir", "finish"] },
+            "path": { "type": "string" },
+            "content": { "type": "string" },
+            "powershell": { "type": "string" },
+            "task_complete": { "type": "boolean" }
+        },
+        "required": ["explanation", "action", "task_complete"]
+    })
+}
+
+/// Monta o corpo da requisição do Gemini (com imagem opcional na última msg do usuário).
+fn gemini_body(
+    system: &str,
+    history: &[(String, String)],
+    image: Option<&ImageAttachment>,
+    schema: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let n = history.len();
+    let contents: Vec<serde_json::Value> = history
+        .iter()
+        .enumerate()
+        .map(|(i, (role, text))| {
+            let mut parts = vec![json!({ "text": text })];
+            if image.is_some() && role == "user" && i + 1 == n {
+                let img = image.unwrap();
+                parts.push(json!({ "inline_data": { "mime_type": img.mime, "data": img.b64 } }));
+            }
+            json!({ "role": role, "parts": parts })
+        })
+        .collect();
+    let mut gen = json!({ "temperature": 0.2 });
+    if let Some(sc) = schema {
+        gen["responseMimeType"] = json!("application/json");
+        gen["responseSchema"] = sc.clone();
+    }
+    json!({
+        "contents": contents,
+        "systemInstruction": { "parts": [{ "text": system }] },
+        "generationConfig": gen
+    })
+}
+
+/// Monta o corpo da requisição da Groq (formato OpenAI; imagem como data-URL).
+fn groq_body(
+    model: &str,
+    system: &str,
+    history: &[(String, String)],
+    image: Option<&ImageAttachment>,
+    want_json: bool,
+) -> serde_json::Value {
+    let n = history.len();
+    let mut messages: Vec<serde_json::Value> = vec![json!({ "role": "system", "content": system })];
+    for (i, (role, text)) in history.iter().enumerate() {
+        let orole = if role == "model" { "assistant" } else { "user" };
+        if image.is_some() && role == "user" && i + 1 == n {
+            let img = image.unwrap();
+            let url = format!("data:{};base64,{}", img.mime, img.b64);
+            messages.push(json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": text },
+                    { "type": "image_url", "image_url": { "url": url } }
+                ]
+            }));
+        } else {
+            messages.push(json!({ "role": orole, "content": text }));
+        }
+    }
+    let mut body = json!({ "model": model, "messages": messages, "temperature": 0.2 });
+    if want_json {
+        body["response_format"] = json!({ "type": "json_object" });
+    }
+    body
+}
+
+/// Chama UM modelo (escolhe o provedor pelo id) e devolve o texto da resposta.
+#[allow(clippy::too_many_arguments)]
+fn call_one(
+    http: &ureq::Agent,
+    gemini_key: &str,
+    groq_key: &str,
+    model: &str,
+    system: &str,
+    history: &[(String, String)],
+    image: Option<&ImageAttachment>,
+    want_json: bool,
+) -> Result<String, String> {
+    if is_groq(model) {
+        if groq_key.trim().is_empty() {
+            return Err("sem Groq key".into());
+        }
+        let body = groq_body(model, system, history, image, want_json);
+        let resp = http
+            .post(GROQ_CHAT_URL)
+            .set("Authorization", &format!("Bearer {}", groq_key.trim()))
+            .send_json(body);
+        match resp {
+            Ok(r) => {
+                let v: serde_json::Value =
+                    r.into_json().map_err(|e| format!("resposta inválida: {e}"))?;
+                v.get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| "sem conteúdo".to_string())
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                Err(format!("HTTP {code}: {}", r.into_string().unwrap_or_default()))
+            }
+            Err(e) => Err(format!("rede: {e}")),
+        }
+    } else {
+        if gemini_key.trim().is_empty() {
+            return Err("sem Gemini key".into());
+        }
+        let schema = if want_json { Some(agent_schema()) } else { None };
+        let body = gemini_body(system, history, image, schema.as_ref());
+        let v = call_gemini(http, gemini_key.trim(), model, body)?;
+        extract_text(&v).ok_or_else(|| "sem texto".to_string())
     }
 }
 
@@ -686,13 +1255,106 @@ fn call_gemini(
     }
 }
 
-/// Lista de modelos a tentar, começando pelo selecionado, depois os Flash e por fim os Pro.
-fn ordered_models(selected: &str) -> Vec<String> {
-    let mut v = vec![selected.to_string()];
-    for m in FLASH_MODELS.iter().chain(PRO_MODELS.iter()) {
-        if *m != selected {
-            v.push((*m).to_string());
+/// Transcreve um áudio com a API Whisper da Groq (multipart/form-data). Devolve o texto.
+fn groq_transcribe(
+    http: &ureq::Agent,
+    key: &str,
+    model: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    if key.trim().is_empty() {
+        return Err("configure a API Key Groq".into());
+    }
+    let boundary = format!("----abyss{}{}", now_secs(), bytes.len());
+    let mut body: Vec<u8> = Vec::with_capacity(bytes.len() + 512);
+    let field = |name: &str, value: &str, body: &mut Vec<u8>| {
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                .as_bytes(),
+        );
+    };
+    field("model", model, &mut body);
+    field("response_format", "text", &mut body);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let ct = format!("multipart/form-data; boundary={boundary}");
+    let resp = http
+        .post(GROQ_TRANSCRIBE_URL)
+        .set("Authorization", &format!("Bearer {}", key.trim()))
+        .set("Content-Type", &ct)
+        .send_bytes(&body);
+    match resp {
+        Ok(r) => r.into_string().map(|s| s.trim().to_string()).map_err(|e| format!("resposta inválida: {e}")),
+        Err(ureq::Error::Status(code, r)) => {
+            Err(format!("HTTP {code}: {}", r.into_string().unwrap_or_default()))
         }
+        Err(e) => Err(format!("rede: {e}")),
+    }
+}
+
+fn push_unique(v: &mut Vec<String>, m: &str) {
+    if !v.iter().any(|x| x == m) {
+        v.push(m.to_string());
+    }
+}
+
+/// Lista de modelos de CHAT a tentar (selecionado primeiro, se for chat-capaz),
+/// com fallback no mesmo provedor e depois no outro. Whisper/Orpheus/segurança
+/// NÃO entram aqui (não são modelos de chat).
+fn ordered_models(selected: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if is_chat_capable(selected) {
+        v.push(selected.to_string());
+    }
+    if is_groq(selected) {
+        for &m in GROQ_CHAT_MODELS {
+            push_unique(&mut v, m);
+        }
+        for &m in GROQ_VISION_MODELS {
+            push_unique(&mut v, m);
+        }
+        for &m in FLASH_MODELS.iter().chain(PRO_MODELS) {
+            push_unique(&mut v, m);
+        }
+    } else {
+        for &m in FLASH_MODELS.iter().chain(PRO_MODELS) {
+            push_unique(&mut v, m);
+        }
+        for &m in GROQ_CHAT_MODELS {
+            push_unique(&mut v, m);
+        }
+        for &m in GROQ_VISION_MODELS {
+            push_unique(&mut v, m);
+        }
+    }
+    if v.is_empty() {
+        v.push(DEFAULT_MODEL.to_string());
+    }
+    v
+}
+
+/// Lista de modelos com VISÃO (para quando há imagem anexada).
+fn vision_models(selected: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if is_vision(selected) {
+        v.push(selected.to_string());
+    }
+    for &m in GROQ_VISION_MODELS {
+        push_unique(&mut v, m);
+    }
+    for &m in FLASH_MODELS.iter().chain(PRO_MODELS) {
+        push_unique(&mut v, m);
+    }
+    if v.is_empty() {
+        v.push(DEFAULT_MODEL.to_string());
     }
     v
 }
@@ -703,19 +1365,26 @@ const RELOAD_WAIT_SECS: u64 = 60;
 /// Chama os modelos em ordem, repetidamente, até um responder. NUNCA falha de vez.
 /// - Se um modelo der limite/cota/erro, passa para o PRÓXIMO em silêncio (sem mostrar erro).
 /// - Se TODOS falharem na rodada, manda o aviso "Modelos recarregando, aguarde…",
-///   espera ~60s e tenta tudo de novo. Devolve o texto da resposta assim que algum modelo responder.
-fn call_gemini_resilient(
+///   espera ~60s e tenta tudo de novo. Devolve o texto assim que algum modelo responder.
+#[allow(clippy::too_many_arguments)]
+fn call_resilient(
     http: &ureq::Agent,
-    key: &str,
+    gemini_key: &str,
+    groq_key: &str,
     models: &[String],
-    body: serde_json::Value,
+    system: &str,
+    history: &[(String, String)],
+    image: Option<&ImageAttachment>,
+    want_json: bool,
     tx: &mpsc::Sender<WorkerMsg>,
     ctx: &egui::Context,
 ) -> String {
     loop {
         for model in models {
-            if let Ok(v) = call_gemini(http, key, model, body.clone()) {
-                if let Some(text) = extract_text(&v) {
+            // A imagem só vai para modelos com visão.
+            let img = if is_vision(model) { image } else { None };
+            if let Ok(text) = call_one(http, gemini_key, groq_key, model, system, history, img, want_json) {
+                if !text.trim().is_empty() {
                     return text;
                 }
             }
@@ -747,6 +1416,52 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Formata segundos-desde-época como "YYYY-MM-DD HH:MM:SS UTC" (algoritmo civil de Hinnant; sem deps).
+fn fmt_utc(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+}
+
+/// Cabeçalho fixo do contexto.md.
+const CONTEXT_HEADER: &str = "# Contexto da conversa — Abyss AI\n\n\
+<!-- Registro automático e LITERAL do chat (SEM IA): só o que você disse e o que a Abyss respondeu. \
+Serve para o modelo continuar quando você troca de modelo no mesmo chat. -->\n";
+
+/// Uma entrada do contexto (cabeçalho + texto), formatação LITERAL e determinística (sem IA).
+fn context_entry(who: &str, model: Option<&str>, ts: &str, text: &str) -> String {
+    match model {
+        Some(m) => format!("\n## {who} · {m} · {ts}\n{text}\n"),
+        None => format!("\n## {who} · {ts}\n{text}\n"),
+    }
+}
+
+/// Deve injetar o contexto? Sim quando houve TROCA de modelo no mesmo chat (e já há histórico).
+fn should_inject_context(last_used: Option<&str>, current: &str, history_empty: bool) -> bool {
+    last_used.map_or(false, |m| m != current) && !history_empty
+}
+
+/// Monta a 1ª mensagem após a troca: recap do contexto + a fala atual do usuário (vai silenciosa).
+fn switch_preamble(ctx_block: &str, user_msg: &str) -> String {
+    format!(
+        "[CONTINUAÇÃO DA CONVERSA — você assumiu no lugar de outro modelo, no MESMO chat. \
+         Abaixo está o registro literal do que já foi dito (🧑 Você = usuário, 🤖 Abyss = assistente). \
+         Continue de onde paramos, com naturalidade; isto é só CONTEXTO, não um novo pedido]:\n\n\
+         {ctx_block}\n\n[FIM DO CONTEXTO. Responda agora à próxima mensagem do usuário:]\n{user_msg}"
+    )
 }
 
 fn load_memory(path: &std::path::Path) -> Vec<MemoryEntry> {
@@ -879,10 +1594,180 @@ fn write_file_in(base: &std::path::Path, rel: &str, content: &str) -> String {
 
 fn read_file_in(base: &std::path::Path, rel: &str) -> String {
     let path = resolve_path(base, rel);
+    // Documentos (Excel/Word/PDF/PowerPoint) → extrai o texto; senão lê como texto puro.
+    if let Some(result) = extract_document(&path) {
+        return match result {
+            Ok(text) => text,
+            Err(e) => format!("ERRO ao extrair o documento {}: {e}", path.display()),
+        };
+    }
     match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => format!("ERRO ao ler {}: {e}", path.display()),
     }
+}
+
+// ----------------------------- Leitura de documentos (Excel/Word/PDF/PowerPoint) -----------------------------
+
+/// Se `path` for um documento conhecido, extrai o TEXTO; `None` deixa o chamador ler como texto puro.
+fn extract_document(path: &std::path::Path) -> Option<Result<String, String>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" => Some(extract_spreadsheet(path)),
+        "docx" => Some(extract_docx(path)),
+        "pptx" => Some(extract_pptx(path)),
+        "pdf" => Some(extract_pdf(path)),
+        _ => None,
+    }
+}
+
+/// Excel / LibreOffice Calc → texto (uma seção por planilha; células separadas por " | ").
+fn extract_spreadsheet(path: &std::path::Path) -> Result<String, String> {
+    use calamine::{open_workbook_auto, Reader};
+    let mut wb = open_workbook_auto(path).map_err(|e| format!("não abriu a planilha: {e}"))?;
+    let mut out = String::new();
+    let names = wb.sheet_names().to_owned();
+    for name in &names {
+        let range = match wb.worksheet_range(name) {
+            Ok(r) => r,
+            Err(e) => {
+                out.push_str(&format!("# Planilha: {name} (erro ao ler: {e})\n\n"));
+                continue;
+            }
+        };
+        out.push_str(&format!("# Planilha: {name}  ({} linhas)\n", range.rows().count()));
+        for row in range.rows() {
+            let cells: Vec<String> = row.iter().map(|c| c.to_string()).collect();
+            out.push_str(cells.join(" | ").trim_end());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if out.trim().is_empty() {
+        Ok("(planilha sem dados)".into())
+    } else {
+        Ok(tidy_lines(&out))
+    }
+}
+
+/// Word (.docx) → texto. O .docx é um ZIP cujo conteúdo principal é word/document.xml.
+fn extract_docx(path: &std::path::Path) -> Result<String, String> {
+    let xml = read_zip_entry(path, "word/document.xml")?;
+    let text = tidy_lines(&xml_to_text(&xml, &["w:p", "w:tr"]));
+    if text.trim().is_empty() {
+        Ok("(documento Word sem texto)".into())
+    } else {
+        Ok(text)
+    }
+}
+
+/// PowerPoint (.pptx) → texto, slide a slide (ppt/slides/slideN.xml).
+fn extract_pptx(path: &std::path::Path) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("não abriu: {e}"))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("pptx inválido: {e}"))?;
+    let mut names: Vec<String> = (0..zip.len())
+        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter(|n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"))
+        .collect();
+    names.sort_by_key(|n| slide_index(n));
+    let mut out = String::new();
+    for (i, name) in names.iter().enumerate() {
+        let mut f = zip.by_name(name).map_err(|e| format!("{e}"))?;
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut f, &mut xml).map_err(|e| format!("{e}"))?;
+        out.push_str(&format!("# Slide {}\n", i + 1));
+        out.push_str(&xml_to_text(&xml, &["a:p"]));
+        out.push_str("\n\n");
+    }
+    if out.trim().is_empty() {
+        Ok("(apresentação sem texto)".into())
+    } else {
+        Ok(tidy_lines(&out))
+    }
+}
+
+fn slide_index(name: &str) -> u32 {
+    name.trim_start_matches("ppt/slides/slide")
+        .trim_end_matches(".xml")
+        .parse()
+        .unwrap_or(0)
+}
+
+/// PDF → texto (pdf-extract).
+fn extract_pdf(path: &std::path::Path) -> Result<String, String> {
+    pdf_extract::extract_text(path)
+        .map_err(|e| format!("não extraiu o PDF: {e}"))
+        .map(|t| tidy_lines(&t))
+}
+
+/// Lê uma entrada de texto de dentro de um arquivo ZIP (docx/pptx são ZIPs OOXML).
+fn read_zip_entry(path: &std::path::Path, name: &str) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("não abriu: {e}"))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("arquivo inválido/corrompido: {e}"))?;
+    let mut f = zip
+        .by_name(name)
+        .map_err(|_| format!("entrada '{name}' não encontrada no documento"))?;
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut f, &mut s).map_err(|e| format!("leitura: {e}"))?;
+    Ok(s)
+}
+
+/// Extrai o texto cru de um XML do OOXML: quebra linha nos `para_tags`, remove as tags e decodifica entidades.
+fn xml_to_text(xml: &str, para_tags: &[&str]) -> String {
+    let mut x = xml.to_string();
+    for t in para_tags {
+        x = x.replace(&format!("</{t}>"), "\n");
+    }
+    x = x
+        .replace("<w:tab/>", "\t")
+        .replace("<w:br/>", "\n")
+        .replace("<w:cr/>", "\n")
+        .replace("<a:br/>", "\n");
+    let mut out = String::with_capacity(x.len() / 2);
+    let mut in_tag = false;
+    for ch in x.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    decode_xml_entities(&out)
+}
+
+/// Decodifica as entidades XML básicas (&amp; por último para não recriar entidades).
+fn decode_xml_entities(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Colapsa linhas em branco repetidas e remove espaços ao fim das linhas.
+fn tidy_lines(s: &str) -> String {
+    let mut out = String::new();
+    let mut blank = 0;
+    for line in s.lines() {
+        let l = line.trim_end();
+        if l.trim().is_empty() {
+            blank += 1;
+            if blank <= 1 {
+                out.push('\n');
+            }
+        } else {
+            blank = 0;
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -896,7 +1781,164 @@ fn truncate_str(s: &str, max: usize) -> String {
     format!("{}…(truncado)", &s[..end])
 }
 
-const SKIP_NAMES: &[&str] = &[".git", "target", "updateabyss", "abyss_memory.json"];
+/// Mantém os ÚLTIMOS `max` bytes (o trecho mais recente do contexto), sem quebrar caractere.
+fn truncate_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…(início do contexto truncado)\n{}", &s[start..])
+}
+
+/// Tamanho legível com unidade automática: B, KB, MB, GB ou TB (base 1024).
+fn human_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    const TB: f64 = GB * 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else if b < TB {
+        format!("{:.1} GB", b / GB)
+    } else {
+        format!("{:.1} TB", b / TB)
+    }
+}
+
+/// Nome do arquivo (sem o caminho).
+fn file_name_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("arquivo")
+        .to_string()
+}
+
+/// MIME a partir da extensão (para imagem e áudio).
+fn mime_from_ext(path: &str) -> String {
+    let e = std::path::Path::new(path)
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let m = match e.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" | "mp4" => "audio/mp4",
+        "ogg" | "opus" => "audio/ogg",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "webm" => "audio/webm",
+        _ => "application/octet-stream",
+    };
+    m.to_string()
+}
+
+/// Abre um seletor de arquivos nativo (via PowerShell/WinForms) e devolve o caminho escolhido.
+fn pick_file_path(filter: &str, title: &str) -> Option<String> {
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
+         $d = New-Object System.Windows.Forms.OpenFileDialog; \
+         $d.Filter = '{filter}'; $d.Title = '{title}'; \
+         if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ [Console]::Out.Write($d.FileName) }}"
+    );
+    let out = std::process::Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-Sta", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// Thread: escolhe uma imagem, lê e codifica em base64; devolve via canal.
+fn spawn_pick_image(ctx: egui::Context, tx: mpsc::Sender<WorkerMsg>) {
+    thread::spawn(move || {
+        match pick_file_path(
+            "Imagens|*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp",
+            "Selecione uma imagem",
+        ) {
+            Some(path) => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let att = ImageAttachment {
+                        name: file_name_of(&path),
+                        mime: mime_from_ext(&path),
+                        b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    };
+                    let _ = tx.send(WorkerMsg::ImagePicked(att));
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::PickError(format!("Falha ao ler a imagem: {e}")));
+                }
+            },
+            None => {
+                let _ = tx.send(WorkerMsg::PickCancelled);
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Thread: escolhe um áudio/música, transcreve com Whisper (Groq); devolve o texto via canal.
+fn spawn_pick_audio(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerMsg>,
+    http: ureq::Agent,
+    groq_key: String,
+    whisper: String,
+) {
+    thread::spawn(move || {
+        match pick_file_path(
+            "Áudio e música|*.mp3;*.wav;*.m4a;*.ogg;*.opus;*.flac;*.aac;*.webm;*.mp4",
+            "Selecione um áudio ou música",
+        ) {
+            Some(path) => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let name = file_name_of(&path);
+                    match groq_transcribe(&http, &groq_key, &whisper, &name, &bytes) {
+                        Ok(text) if !text.trim().is_empty() => {
+                            let _ = tx.send(WorkerMsg::AudioTranscribed { name, text });
+                        }
+                        Ok(_) => {
+                            let _ = tx.send(WorkerMsg::PickError(
+                                "A transcrição veio vazia (áudio sem fala?).".into(),
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(WorkerMsg::PickError(format!("Falha ao transcrever: {e}")));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::PickError(format!("Falha ao ler o áudio: {e}")));
+                }
+            },
+            None => {
+                let _ = tx.send(WorkerMsg::PickCancelled);
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+const SKIP_NAMES: &[&str] = &[".git", "target", "updateabyss", "abyss_memory.json", "contexto.md"];
 
 fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
@@ -1034,46 +2076,28 @@ fn run_powershell(script: &str, work_dir: &std::path::Path) -> String {
 
 /// Núcleo do agente: loop de passos (read_file / write_file / run) na pasta de trabalho.
 /// Usa a chamada resiliente: nunca para por erro de API (troca de modelo / espera e tenta de novo).
+/// A imagem (se houver) vai só no PRIMEIRO passo (depois o modelo já "viu" e respondeu).
 #[allow(clippy::too_many_arguments)]
 fn run_agent_loop(
     ctx: &egui::Context,
     tx: &mpsc::Sender<WorkerMsg>,
     http: &ureq::Agent,
-    key: &str,
+    gemini_key: &str,
+    groq_key: &str,
     models: &[String],
     system: &str,
     history: &mut Vec<(String, String)>,
     work_dir: &mut std::path::PathBuf,
     auto_run: bool,
     max_steps: usize,
+    image: Option<ImageAttachment>,
 ) {
-    let schema = json!({
-        "type": "object",
-        "properties": {
-            "explanation": { "type": "string" },
-            "action": { "type": "string", "enum": ["run", "write_file", "read_file", "change_dir", "finish"] },
-            "path": { "type": "string" },
-            "content": { "type": "string" },
-            "powershell": { "type": "string" },
-            "task_complete": { "type": "boolean" }
-        },
-        "required": ["explanation", "action", "task_complete"]
-    });
-
-    for _ in 0..max_steps {
-        let body = json!({
-            "contents": contents_from(history),
-            "systemInstruction": { "parts": [{ "text": system }] },
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json",
-                "responseSchema": schema
-            }
-        });
+    for step in 0..max_steps {
+        let img = if step == 0 { image.as_ref() } else { None };
 
         // Chamada resiliente: troca de modelo em silêncio em caso de limite/cota,
         // avisa "recarregando" e tenta de novo a cada 60s. Nunca para por erro de API.
-        let raw = call_gemini_resilient(http, key, models, body, tx, ctx);
+        let raw = call_resilient(http, gemini_key, groq_key, models, system, history, img, true, tx, ctx);
         history.push(("model".into(), raw.clone()));
 
         let parsed: serde_json::Value = serde_json::from_str(&raw)
@@ -1121,7 +2145,7 @@ fn run_agent_loop(
                 let data = read_file_in(work_dir.as_path(), &path);
                 let _ = tx.send(WorkerMsg::AgentOut(truncate_str(&data, 3000)));
                 ctx.request_repaint();
-                history.push(("user".into(), format!("Conteúdo de {path}:\n{}", truncate_str(&data, 16000))));
+                history.push(("user".into(), format!("Conteúdo de {path}:\n{}", truncate_str(&data, 40000))));
             }
             "run" if !ps.trim().is_empty() => {
                 acted = true;
@@ -1148,21 +2172,25 @@ fn run_agent_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent(
     ctx: egui::Context,
     tx: mpsc::Sender<WorkerMsg>,
     http: ureq::Agent,
-    key: String,
+    gemini_key: String,
+    groq_key: String,
     models: Vec<String>,
     system: String,
     mut history: Vec<(String, String)>,
     work_dir: std::path::PathBuf,
     auto_run: bool,
+    image: Option<ImageAttachment>,
 ) {
     thread::spawn(move || {
         let mut wd = work_dir;
         run_agent_loop(
-            &ctx, &tx, &http, &key, &models, &system, &mut history, &mut wd, auto_run, MAX_AGENT_STEPS,
+            &ctx, &tx, &http, &gemini_key, &groq_key, &models, &system, &mut history, &mut wd,
+            auto_run, MAX_AGENT_STEPS, image,
         );
         // Persiste a pasta atual (caso o agente tenha feito change_dir) para a próxima mensagem.
         let _ = tx.send(WorkerMsg::WorkDir(wd.to_string_lossy().to_string()));
@@ -1173,11 +2201,13 @@ fn spawn_agent(
 
 /// Auto-edição do próprio Abyss: push → cópia `updateabyss` → o agente edita →
 /// `cargo build` → promove se compilar; se não, mantém a cópia para iterar depois.
+#[allow(clippy::too_many_arguments)]
 fn spawn_self_update(
     ctx: egui::Context,
     tx: mpsc::Sender<WorkerMsg>,
     http: ureq::Agent,
     key: String,
+    groq_key: String,
     models: Vec<String>,
     memory_block: String,
     instruction: String,
@@ -1247,7 +2277,7 @@ fn spawn_self_update(
         let mut history: Vec<(String, String)> = vec![("user".to_string(), seed)];
         let mut wd = update_dir.clone();
         run_agent_loop(
-            &ctx, &tx, &http, &key, &models, &system, &mut history, &mut wd, true, 24,
+            &ctx, &tx, &http, &key, &groq_key, &models, &system, &mut history, &mut wd, true, 24, None,
         );
 
         say("🛠 Compilando a cópia (cargo build)… na 1ª vez pode levar alguns minutos.".into());
@@ -1289,6 +2319,25 @@ fn load_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
+    // Modo utilitário/teste: `abyss --extract <arquivo> [<saida>]` extrai o texto de um documento
+    // (Excel/Word/PDF/PowerPoint/…). Com <saida>, grava no arquivo; senão imprime no console.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--extract" {
+        let input = std::path::PathBuf::from(&args[2]);
+        let text = match extract_document(&input) {
+            Some(Ok(t)) => t,
+            Some(Err(e)) => format!("ERRO: {e}"),
+            None => std::fs::read_to_string(&input).unwrap_or_else(|e| format!("ERRO: {e}")),
+        };
+        match args.get(3) {
+            Some(outp) => {
+                let _ = std::fs::write(outp, text);
+            }
+            None => println!("{text}"),
+        }
+        return Ok(());
+    }
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 640.0])
@@ -1306,7 +2355,11 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_memory_command, ordered_models, parse_segments, resolve_path, truncate_str, Segment};
+    use super::{
+        context_entry, decode_xml_entities, detect_memory_command, fmt_utc, is_groq, ordered_models,
+        parse_segments, resolve_path, should_inject_context, switch_preamble, truncate_str,
+        truncate_tail, vision_models, xml_to_text, Segment,
+    };
     use std::path::Path;
 
     #[test]
@@ -1363,12 +2416,134 @@ mod tests {
     }
 
     #[test]
+    fn provedores_detectados() {
+        assert!(is_groq("llama-3.3-70b-versatile"));
+        assert!(is_groq("meta-llama/llama-4-scout-17b-16e-instruct"));
+        assert!(is_groq("openai/gpt-oss-120b"));
+        assert!(!is_groq("gemini-2.5-flash"));
+        assert!(!is_groq("gemini-1.5-pro"));
+    }
+
+    #[test]
+    fn groq_selecionado_vem_primeiro_e_cai_para_gemini() {
+        let v = ordered_models("llama-3.1-8b-instant");
+        assert_eq!(v[0], "llama-3.1-8b-instant");
+        // fallback cruza para o Gemini também
+        assert!(v.iter().any(|m| m == "gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn modelo_nao_chat_roteia_para_chat() {
+        // Whisper não é chat → não aparece como 1º; cai para um modelo de chat de verdade.
+        let v = ordered_models("whisper-large-v3-turbo");
+        assert!(v.iter().all(|m| m != "whisper-large-v3-turbo"));
+        assert!(super::is_chat_capable(&v[0]));
+    }
+
+    #[test]
+    fn visao_inclui_scout_e_gemini() {
+        let v = vision_models("llama-3.1-8b-instant"); // selecionado não tem visão
+        assert!(v.iter().any(|m| m == "meta-llama/llama-4-scout-17b-16e-instruct"));
+        assert!(v.iter().any(|m| m.starts_with("gemini")));
+    }
+
+    #[test]
     fn truncate_respeita_limite() {
         assert_eq!(truncate_str("abc", 10), "abc");
         assert!(truncate_str("abcdefghij", 5).starts_with("abcde"));
         // não deve quebrar em caractere multibyte
         let s = "áéíóú".repeat(3);
         let _ = truncate_str(&s, 5); // não pode panicar
+    }
+
+    #[test]
+    fn truncate_tail_mantem_o_fim() {
+        assert_eq!(truncate_tail("abc", 10), "abc");
+        assert!(truncate_tail("0123456789", 4).ends_with("6789"));
+        // não pode panicar em caractere multibyte
+        let s = "áéíóú".repeat(4);
+        let _ = truncate_tail(&s, 5);
+    }
+
+    #[test]
+    fn human_size_unidades() {
+        assert_eq!(super::human_size(0), "0 B");
+        assert_eq!(super::human_size(512), "512 B");
+        assert_eq!(super::human_size(1536), "1.5 KB");
+        assert!(super::human_size(5 * 1024 * 1024).ends_with("MB"));
+        assert!(super::human_size(3usize * 1024 * 1024 * 1024).ends_with("GB"));
+    }
+
+    #[test]
+    fn xml_to_text_extrai_paragrafos_e_entidades() {
+        let xml = r#"<w:p><w:r><w:t>Olá</w:t></w:r></w:p><w:p><w:r><w:t>mundo &amp; cia &lt;ok&gt;</w:t></w:r></w:p>"#;
+        let t = xml_to_text(xml, &["w:p"]);
+        assert!(t.contains("Olá"));
+        assert!(t.contains("mundo & cia <ok>"));
+        assert!(t.lines().count() >= 2); // dois parágrafos viraram duas linhas
+    }
+
+    #[test]
+    fn decode_entidades_basicas() {
+        assert_eq!(
+            decode_xml_entities("a &amp; b &lt;c&gt; &quot;d&quot;"),
+            "a & b <c> \"d\""
+        );
+    }
+
+    #[test]
+    fn fmt_utc_epoch_e_data_conhecida() {
+        assert_eq!(fmt_utc(0), "1970-01-01 00:00:00 UTC");
+        // 1609459200 = 2021-01-01 00:00:00 UTC
+        assert!(fmt_utc(1609459200).starts_with("2021-01-01"));
+        assert!(fmt_utc(1609459200).ends_with("UTC"));
+    }
+
+    #[test]
+    fn context_entry_formata_literal() {
+        assert_eq!(context_entry("🧑 Você", None, "T", "oi"), "\n## 🧑 Você · T\noi\n");
+        let e = context_entry("🤖 Abyss", Some("gemini-2.5-flash"), "T", "olá");
+        assert!(e.contains("🤖 Abyss · gemini-2.5-flash · T"));
+        assert!(e.contains("olá"));
+    }
+
+    #[test]
+    fn injeta_contexto_so_quando_troca_modelo() {
+        // 1ª mensagem (sem modelo anterior) → não injeta
+        assert!(!should_inject_context(None, "gemini-2.5-flash", true));
+        // mesmo modelo → não injeta
+        assert!(!should_inject_context(Some("gemini-2.5-flash"), "gemini-2.5-flash", false));
+        // trocou de modelo, com histórico → injeta
+        assert!(should_inject_context(Some("gemini-2.5-flash"), "llama-3.3-70b-versatile", false));
+        // trocou mas o chat está vazio → não injeta
+        assert!(!should_inject_context(Some("gemini-2.5-flash"), "llama-3.3-70b-versatile", true));
+    }
+
+    #[test]
+    fn switch_preamble_inclui_recap_e_pergunta() {
+        let p = switch_preamble("RECAP-AQUI", "minha pergunta nova");
+        assert!(p.contains("RECAP-AQUI"));
+        assert!(p.contains("minha pergunta nova"));
+        assert!(p.contains("CONTEXTO"));
+    }
+
+    // Exercita o mesmo fluxo do append_context: monta o markdown (cabeçalho + entradas) com as
+    // funções reais, grava em arquivo e lê de volta — prova a persistência e o formato do contexto.md.
+    #[test]
+    fn contexto_md_grava_e_le_de_volta() {
+        let mut md = String::new();
+        md.push_str(super::CONTEXT_HEADER);
+        md.push_str(&context_entry("🧑 Você", None, "T1", "qual a capital da França?"));
+        md.push_str(&context_entry("🤖 Abyss", Some("gemini-2.5-flash"), "T1", "Paris."));
+        let path = std::env::temp_dir().join(format!("abyss_ctx_test_{}.md", std::process::id()));
+        std::fs::write(&path, &md).unwrap();
+        let back = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(back.contains("# Contexto da conversa"));
+        assert!(back.contains("🧑 Você · T1"));
+        assert!(back.contains("qual a capital da França?"));
+        assert!(back.contains("🤖 Abyss · gemini-2.5-flash · T1"));
+        assert!(back.contains("Paris."));
     }
 
     #[test]

@@ -95,10 +95,12 @@ Binário final: **`target\release\abyss.exe`**.
 Na barra superior há o seletor **Modelos:** (o motor Gemini por baixo), dividido em dois grupos:
 
 - **Flash — rápidos, cota maior:** `gemini-2.5-flash` (padrão), `gemini-2.5-flash-lite`,
-  `gemini-2.0-flash`, `gemini-2.0-flash-lite`, `gemini-1.5-flash`, `gemini-1.5-flash-8b`.
-- **Pro — raciocínio profundo, cota baixa:** `gemini-2.5-pro`, `gemini-1.5-pro`.
-  São os modelos de raciocínio mais forte, mas a cota gratuita é bem menor
-  (historicamente ~50 requisições/dia no 1.5 Pro).
+  `gemini-2.0-flash`, `gemini-2.0-flash-lite`.
+- **Pro — raciocínio profundo, cota baixa:** `gemini-2.5-pro`.
+  É o modelo de raciocínio mais forte, mas a cota gratuita é bem menor.
+
+> Os modelos **Gemini 1.5** (e anteriores) foram **descontinuados** pelo Google e removidos do app.
+> Além do Gemini, o app também usa modelos da **Groq** (texto, visão e Whisper) — veja o seletor.
 
 > A camada gratuita tem **limite diário de requisições por modelo**. Cada passo do Agente é
 > 1 requisição, então tarefas/auto-update longos esgotam a cota rápido — principalmente nos
