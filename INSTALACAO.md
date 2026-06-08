@@ -104,6 +104,9 @@ Na barra superior há o seletor **Gemini:**, dividido em dois grupos:
 > 1 requisição, então tarefas/auto-update longos esgotam a cota rápido — principalmente nos
 > **Pro**. Troque de modelo no seletor (ex.: use Flash para tarefas longas e Pro para raciocínio
 > pontual) ou gere uma key com billing.
+>
+> **Fallback automático:** se um modelo der erro (cota/limite), o app tenta sozinho os outros
+> modelos em ordem (selecionado → demais Flash → Pro) até um responder.
 
 ---
 

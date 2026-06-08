@@ -42,10 +42,14 @@ copiado dentro de um bloco markdown com três crases (```), indicando a linguage
 (ex.: ```sql, ```txt, ```python, ```bash).";
 
 const AGENT_SYSTEM: &str = r#"Você é um AGENTE DEV/AUTOMAÇÃO rodando na máquina Windows do usuário.
-Você trabalha DENTRO de uma PASTA DE TRABALHO (informada abaixo) e pode:
+Você tem acesso ao COMPUTADOR INTEIRO (qualquer pasta/arquivo do Windows) e pode:
 - ler arquivos (para entender antes de editar),
 - criar/editar QUALQUER tipo de arquivo de texto (código, config, .md, .json, .html, etc.),
-- executar comandos PowerShell (executados a partir da pasta de trabalho).
+- executar comandos PowerShell.
+
+Sobre caminhos:
+- Use caminhos ABSOLUTOS do Windows para acessar qualquer lugar do PC (ex.: C:\Users\<voce>\Desktop\arquivo.txt). Descubra pastas com comandos: $env:USERPROFILE, [Environment]::GetFolderPath('Desktop'), Get-ChildItem.
+- Caminhos RELATIVOS são resolvidos dentro da PASTA DE TRABALHO (abaixo) — prefira-os só quando o usuário pedir para trabalhar DENTRO de uma pasta específica.
 
 Para CADA passo responda SOMENTE com um objeto JSON:
 - "explanation": em português, 1-2 frases, o que fará neste passo (ou o resumo final).
@@ -250,7 +254,7 @@ impl App {
 
         let http = self.http.clone();
         let key = self.api_key.trim().to_string();
-        let model = self.model.trim().to_string();
+        let models = ordered_models(self.model.trim());
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         self.pending = true;
@@ -261,7 +265,7 @@ impl App {
                 self.chat.transcript.push(Msg::new(Role::User, text.clone()));
                 self.chat.history.push(("user".into(), text));
                 let history = self.chat.history.clone();
-                spawn_chat(ctx2, tx, http, key, model, system, history);
+                spawn_chat(ctx2, tx, http, key, models, system, history);
             }
             Mode::Agent => {
                 let work_dir = std::path::PathBuf::from(self.work_dir.trim());
@@ -274,7 +278,7 @@ impl App {
                 self.agent.history.push(("user".into(), text));
                 let history = self.agent.history.clone();
                 let auto = self.auto_run;
-                spawn_agent(ctx2, tx, http, key, model, system, history, work_dir, auto);
+                spawn_agent(ctx2, tx, http, key, models, system, history, work_dir, auto);
             }
         }
     }
@@ -307,7 +311,7 @@ impl App {
             self.tx.clone(),
             self.http.clone(),
             self.api_key.trim().to_string(),
-            self.model.trim().to_string(),
+            ordered_models(self.model.trim()),
             self.memory_preamble(),
             instruction,
             self.project_root.clone(),
@@ -710,6 +714,44 @@ fn call_gemini(
     }
 }
 
+/// Lista de modelos a tentar, começando pelo selecionado, depois os Flash e por fim os Pro.
+fn ordered_models(selected: &str) -> Vec<String> {
+    let mut v = vec![selected.to_string()];
+    for m in FLASH_MODELS.iter().chain(PRO_MODELS.iter()) {
+        if *m != selected {
+            v.push((*m).to_string());
+        }
+    }
+    v
+}
+
+/// Tenta os modelos em ordem; se um falhar (cota/erro), passa para o próximo até um responder.
+fn call_gemini_fallback(
+    http: &ureq::Agent,
+    key: &str,
+    models: &[String],
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut last = String::from("nenhum modelo disponível");
+    for model in models {
+        match call_gemini(http, key, model, body.clone()) {
+            Ok(v) => {
+                if v.get("candidates").and_then(|c| c.get(0)).is_some() {
+                    return Ok(v);
+                }
+                last = format!(
+                    "{model}: {}",
+                    v.get("error")
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "resposta sem candidatos".to_string())
+                );
+            }
+            Err(e) => last = format!("{model}: {e}"),
+        }
+    }
+    Err(format!("Todos os modelos falharam — último: {last}"))
+}
+
 // ----------------------------- Memória (JSON persistente) -----------------------------
 
 fn memory_path() -> std::path::PathBuf {
@@ -832,50 +874,35 @@ fn detect_memory_command(text: &str) -> Option<String> {
 
 // ----------------------------- Sistema de arquivos / projeto -----------------------------
 
-/// Junta `rel` a `base` com segurança (não permite caminho absoluto nem subir de pasta).
-fn safe_join(base: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
-    let rel = rel.trim().replace('\\', "/");
-    if rel.is_empty() {
-        return None;
+/// Resolve `p`: se for ABSOLUTO, usa direto (acesso ao PC inteiro);
+/// se for RELATIVO, resolve dentro de `base` (a pasta de trabalho).
+fn resolve_path(base: &std::path::Path, p: &str) -> std::path::PathBuf {
+    let pp = std::path::Path::new(p.trim());
+    if pp.is_absolute() {
+        pp.to_path_buf()
+    } else {
+        base.join(pp)
     }
-    let p = std::path::Path::new(&rel);
-    if p.is_absolute() {
-        return None;
-    }
-    let mut out = base.to_path_buf();
-    for comp in p.components() {
-        match comp {
-            std::path::Component::Normal(c) => out.push(c),
-            std::path::Component::CurDir => {}
-            _ => return None, // ParentDir, RootDir, Prefix: bloqueados
-        }
-    }
-    Some(out)
 }
 
 fn write_file_in(base: &std::path::Path, rel: &str, content: &str) -> String {
-    let path = match safe_join(base, rel) {
-        Some(p) => p,
-        None => return format!("ERRO: caminho inválido/não permitido: {rel}"),
-    };
+    let path = resolve_path(base, rel);
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return format!("ERRO ao criar pasta de {rel}: {e}");
         }
     }
     match std::fs::write(&path, content) {
-        Ok(_) => format!("OK: {} bytes gravados em {rel}", content.len()),
-        Err(e) => format!("ERRO ao gravar {rel}: {e}"),
+        Ok(_) => format!("OK: {} bytes gravados em {}", content.len(), path.display()),
+        Err(e) => format!("ERRO ao gravar {}: {e}", path.display()),
     }
 }
 
 fn read_file_in(base: &std::path::Path, rel: &str) -> String {
-    match safe_join(base, rel) {
-        Some(p) => match std::fs::read_to_string(&p) {
-            Ok(s) => s,
-            Err(e) => format!("ERRO ao ler {rel}: {e}"),
-        },
-        None => format!("ERRO: caminho inválido: {rel}"),
+    let path = resolve_path(base, rel);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => format!("ERRO ao ler {}: {e}", path.display()),
     }
 }
 
@@ -1029,7 +1056,7 @@ fn spawn_chat(
     tx: mpsc::Sender<WorkerMsg>,
     http: ureq::Agent,
     key: String,
-    model: String,
+    models: Vec<String>,
     system: String,
     history: Vec<(String, String)>,
 ) {
@@ -1039,7 +1066,7 @@ fn spawn_chat(
             "systemInstruction": { "parts": [{ "text": system }] },
             "generationConfig": { "temperature": 0.7 }
         });
-        let msg = match call_gemini(&http, &key, &model, body) {
+        let msg = match call_gemini_fallback(&http, &key, &models, body) {
             Ok(v) => match extract_text(&v) {
                 Some(t) => WorkerMsg::Chat(t),
                 None => WorkerMsg::ChatErr(format!("Sem resposta utilizável da API: {v}")),
@@ -1059,7 +1086,7 @@ fn run_agent_loop(
     tx: &mpsc::Sender<WorkerMsg>,
     http: &ureq::Agent,
     key: &str,
-    model: &str,
+    models: &[String],
     system: &str,
     history: &mut Vec<(String, String)>,
     work_dir: &std::path::Path,
@@ -1090,7 +1117,7 @@ fn run_agent_loop(
             }
         });
 
-        let v = match call_gemini(http, key, model, body) {
+        let v = match call_gemini_fallback(http, key, models, body) {
             Ok(v) => v,
             Err(e) => {
                 let _ = tx.send(WorkerMsg::AgentErr(e));
@@ -1173,7 +1200,7 @@ fn spawn_agent(
     tx: mpsc::Sender<WorkerMsg>,
     http: ureq::Agent,
     key: String,
-    model: String,
+    models: Vec<String>,
     system: String,
     mut history: Vec<(String, String)>,
     work_dir: std::path::PathBuf,
@@ -1181,7 +1208,7 @@ fn spawn_agent(
 ) {
     thread::spawn(move || {
         run_agent_loop(
-            &ctx, &tx, &http, &key, &model, &system, &mut history, &work_dir, auto_run, MAX_AGENT_STEPS,
+            &ctx, &tx, &http, &key, &models, &system, &mut history, &work_dir, auto_run, MAX_AGENT_STEPS,
         );
         let _ = tx.send(WorkerMsg::AgentDone(history));
         ctx.request_repaint();
@@ -1195,7 +1222,7 @@ fn spawn_self_update(
     tx: mpsc::Sender<WorkerMsg>,
     http: ureq::Agent,
     key: String,
-    model: String,
+    models: Vec<String>,
     memory_block: String,
     instruction: String,
     project_root: std::path::PathBuf,
@@ -1263,7 +1290,7 @@ fn spawn_self_update(
         );
         let mut history: Vec<(String, String)> = vec![("user".to_string(), seed)];
         let ok_loop = run_agent_loop(
-            &ctx, &tx, &http, &key, &model, &system, &mut history, &update_dir, true, 24,
+            &ctx, &tx, &http, &key, &models, &system, &mut history, &update_dir, true, 24,
         );
         if !ok_loop {
             say("Interrompido por erro de API. A pasta 'updateabyss' foi mantida para retomar depois.".into());
@@ -1350,7 +1377,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_memory_command, parse_segments, safe_join, truncate_str, Segment};
+    use super::{detect_memory_command, ordered_models, parse_segments, resolve_path, truncate_str, Segment};
     use std::path::Path;
 
     #[test]
@@ -1381,19 +1408,29 @@ mod tests {
     }
 
     #[test]
-    fn safe_join_aceita_relativo() {
+    fn resolve_relativo_resolve_na_pasta() {
         let base = Path::new("C:/proj");
-        assert_eq!(safe_join(base, "src/main.rs"), Some(Path::new("C:/proj/src/main.rs").to_path_buf()));
-        assert_eq!(safe_join(base, "Cargo.toml"), Some(Path::new("C:/proj/Cargo.toml").to_path_buf()));
+        assert_eq!(resolve_path(base, "src/main.rs"), Path::new("C:/proj/src/main.rs"));
     }
 
     #[test]
-    fn safe_join_bloqueia_escape_e_absoluto() {
+    fn resolve_absoluto_acessa_pc_inteiro() {
         let base = Path::new("C:/proj");
-        assert_eq!(safe_join(base, "../segredo.txt"), None);
-        assert_eq!(safe_join(base, "a/../../b"), None);
-        assert_eq!(safe_join(base, "C:/Windows/system32"), None);
-        assert_eq!(safe_join(base, ""), None);
+        // caminho absoluto é usado direto (acesso ao PC inteiro), não confinado à pasta
+        let abs = resolve_path(base, r"C:\Windows\notepad.exe");
+        assert!(abs.is_absolute());
+        assert!(abs.to_string_lossy().to_lowercase().ends_with("notepad.exe"));
+        assert!(!abs.starts_with("C:/proj"));
+    }
+
+    #[test]
+    fn fallback_ordena_selecionado_primeiro() {
+        let v = ordered_models("gemini-2.0-flash");
+        assert_eq!(v[0], "gemini-2.0-flash");
+        assert!(v.contains(&"gemini-2.5-flash".to_string()));
+        assert!(v.contains(&"gemini-2.5-pro".to_string()));
+        // sem duplicar o selecionado
+        assert_eq!(v.iter().filter(|m| *m == "gemini-2.0-flash").count(), 1);
     }
 
     #[test]

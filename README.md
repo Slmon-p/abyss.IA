@@ -171,16 +171,23 @@ O Abyss lembra de fatos e instruções suas entre sessões.
 
 No modo **🤖 Agente Local** o agente agora é um agente de desenvolvimento.
 
-### Pasta de trabalho
-- Campo **Pasta:** define onde o agente atua. Botão **📁** abre o seletor de pastas do Windows.
-- Tudo que o agente lê/escreve/executa acontece **dentro dessa pasta** (caminhos relativos;
-  ele não consegue subir de pasta nem usar caminhos absolutos — proteção `safe_join`).
+### Acesso ao PC inteiro + pasta de trabalho
+- O agente tem acesso ao **computador inteiro**: lê/cria/edita arquivos em **qualquer caminho
+  absoluto** do Windows (ex.: `C:\Users\...\Desktop\arquivo.txt`) e roda comandos em qualquer lugar.
+- O campo **Pasta:** (botão **📁** abre o seletor) define a **pasta de trabalho**, usada só como
+  base para **caminhos relativos**. Ou seja: ele **só fica restrito a uma pasta quando você pedir**
+  (usando caminhos relativos); por padrão usa o PC todo.
+
+### Troca automática de modelo (fallback)
+Se o modelo selecionado falhar numa requisição (cota esgotada, erro, etc.), o app **tenta
+automaticamente os outros modelos** em ordem — o selecionado → demais **Flash** → **Pro** — até um
+responder. Assim uma resposta não trava só porque um modelo bateu no limite diário.
 
 ### Edição de qualquer arquivo
 A cada passo o Gemini responde em JSON com uma **ação**:
-- `read_file` (path) — lê um arquivo para entender antes de editar;
+- `read_file` (path) — lê um arquivo (relativo à pasta de trabalho ou absoluto);
 - `write_file` (path + content) — cria/sobrescreve **qualquer** arquivo de texto com o conteúdo completo;
-- `run` (powershell) — executa um comando na pasta de trabalho;
+- `run` (powershell) — executa um comando (a partir da pasta de trabalho, mas pode acessar todo o PC);
 - `finish` — encerra com um resumo.
 
 O app executa a ação, devolve o resultado ao modelo e ele decide o próximo passo (até 16 passos).
