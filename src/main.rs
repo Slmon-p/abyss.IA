@@ -3,6 +3,7 @@
 // Provedores de modelo:
 //   - Google Gemini  (API generativelanguage, ?key= ou Bearer)
 //   - Groq           (API compatível com OpenAI: chat, visão e Whisper p/ áudio)
+//   - OpenRouter     (API compatível com OpenAI: modelos gratuitos de chat ":free")
 //
 // Backend (lógica): chamadas HTTP às APIs + execução de comandos no SO.
 // Frontend (UI):     egui/eframe (OpenGL, sem Chromium/WebView).
@@ -37,6 +38,8 @@ use std::time::Duration;
 // ---- Configuração padrão (pode ser trocada na UI, em ⚙ Configurações) ----
 const DEFAULT_API_KEY: &str = "AQ.Ab8RN6KsIezTPxmcZCPV2ebOHVEaIxsM-DpmzQw_obsIeL4NSg";
 const DEFAULT_GROQ_KEY: &str = "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";
+const DEFAULT_OPENROUTER_KEY: &str =
+    "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";
 const DEFAULT_MODEL: &str = "gemini-2.5-flash";
 
 /// Modelos Gemini Flash — rápidos, cota gratuita maior. (1.5 e anteriores foram descontinuados.)
@@ -79,6 +82,215 @@ const GROQ_SAFETY_MODELS: &[&str] = &[
     "openai/gpt-oss-safeguard-20b",
 ];
 
+// ---- OpenRouter (API compatível com OpenAI) ----
+const OPENROUTER_CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+
+/// OpenRouter — modelos GRATUITOS (cota grátis; ids terminam em ":free").
+/// Servem como modelo de chat e entram no fallback resiliente.
+/// Ordem: os que respondem na hora primeiro (os grandes costumam dar 429/limite,
+/// e aí o fallback passa em silêncio para o próximo).
+/// Catálogo verificado ao vivo na API do OpenRouter (slugs antigos foram descontinuados).
+const OPENROUTER_CHAT_MODELS: &[&str] = &[
+    "openai/gpt-oss-20b:free",
+    "moonshotai/kimi-k2.6:free",
+    "google/gemma-4-31b-it:free",
+    "z-ai/glm-4.5-air:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "qwen/qwen3-coder:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+];
+
+// ---- Tier list de EXIBIÇÃO no seletor (mais inteligente → mais simples) ----
+// Mistura todos os provedores e ordena por capacidade geral. É só a ORDEM da UI:
+// não muda o roteamento/fallback (isso fica em `ordered_models`). Ranqueamento é um
+// julgamento (tamanho/reputação/benchmarks gerais); ajuste à vontade.
+// IMPORTANTE: todo modelo de CHAT precisa estar em exatamente UM destes tiers
+// (o teste `tier_list_cobre_todos_os_modelos_de_chat` garante isso).
+
+/// 🥇 Topo — raciocínio mais profundo (os "que mais sabem").
+const TIER_TOP: &[&str] = &[
+    "gemini-2.5-pro",
+    "openai/gpt-oss-120b",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+];
+/// 🥈 Muito capazes — modelos grandes e fortes para uso geral.
+const TIER_STRONG: &[&str] = &[
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "moonshotai/kimi-k2.6:free",
+    "gemini-2.5-flash",
+];
+/// 🥉 Equilibrados — bom meio-termo entre qualidade e velocidade.
+const TIER_BALANCED: &[&str] = &[
+    "gemini-2.0-flash",
+    "z-ai/glm-4.5-air:free",
+    "qwen/qwen3-32b",
+    "google/gemma-4-31b-it:free",
+    "qwen/qwen3-coder:free",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-20b:free",
+    "groq/compound",
+    "groq/compound-mini",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+];
+/// ⚡ Rápidos e leves — respostas diretas, menos "profundidade".
+const TIER_FAST: &[&str] = &[
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "llama-3.1-8b-instant",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "allam-2-7b",
+];
+
+// ---- Paleta "Abyssal Dark Blue" + tema da interface --------------------------
+// Inspirada nas profundezas de um abismo: azuis muito escuros, acentos vivos e
+// texto cor de gelo. Centraliza as cores para manter a UI coesa e profissional.
+mod theme {
+    use eframe::egui::Color32;
+
+    pub const BG_ABYSS: Color32 = Color32::from_rgb(0x0F, 0x17, 0x2A); // fundo da janela/chat
+    pub const BG_DEEP: Color32 = Color32::from_rgb(0x0B, 0x11, 0x20); // fundo mais profundo (input/código)
+    pub const BG_PANEL: Color32 = Color32::from_rgb(0x1E, 0x29, 0x3B); // header/footer
+    pub const SURFACE: Color32 = Color32::from_rgb(0x16, 0x21, 0x33); // cartões/superfícies
+    pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x24, 0x31, 0x48);
+
+    pub const ACCENT: Color32 = Color32::from_rgb(0x3B, 0x82, 0xF6); // azul vivo (primário)
+    pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x60, 0xA5, 0xFA);
+    pub const CYAN: Color32 = Color32::from_rgb(0x0E, 0xA5, 0xE9); // sky/cyan
+
+    pub const TEXT_MAIN: Color32 = Color32::from_rgb(0xF8, 0xFA, 0xFC); // branco/gelo
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x94, 0xA3, 0xB8); // cinza azulado
+
+    pub const BORDER: Color32 = Color32::from_rgb(0x33, 0x41, 0x55); // borda suave
+    pub const BORDER_SOFT: Color32 = Color32::from_rgb(0x24, 0x31, 0x48);
+
+    pub const WARN: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B); // âmbar (aviso)
+    pub const DANGER: Color32 = Color32::from_rgb(0xEF, 0x44, 0x44); // vermelho (alerta forte)
+
+    /// Mesma cor com baixa opacidade (para fundos translúcidos de selos/badges).
+    pub fn soft(c: Color32, alpha: u8) -> Color32 {
+        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+    }
+}
+
+/// Aplica o tema "Abyssal Dark Blue": cores, cantos arredondados (flat, sem 3D)
+/// e espaçamentos respiráveis. Substitui o visual escuro padrão do egui.
+fn apply_abyss_theme(ctx: &egui::Context) {
+    use theme::*;
+    let mut style = (*ctx.style()).clone();
+    let mut v = egui::Visuals::dark();
+    v.dark_mode = true;
+    v.panel_fill = BG_ABYSS; // fundo do CentralPanel (chat)
+    v.window_fill = BG_PANEL; // janelas flutuantes (Configurações)
+    v.window_stroke = egui::Stroke::new(1.0, BORDER);
+    v.window_rounding = egui::Rounding::same(12.0);
+    v.menu_rounding = egui::Rounding::same(10.0);
+    v.extreme_bg_color = BG_DEEP; // fundo de TextEdit/código
+    v.faint_bg_color = SURFACE;
+    v.override_text_color = Some(TEXT_MAIN);
+    v.hyperlink_color = CYAN;
+    v.selection.bg_fill = soft(ACCENT, 90);
+    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+
+    let rounding = egui::Rounding::same(8.0);
+
+    // Não interativo (rótulos, fundos de grupos).
+    v.widgets.noninteractive.bg_fill = SURFACE;
+    v.widgets.noninteractive.weak_bg_fill = SURFACE;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER_SOFT);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_MUTED);
+    v.widgets.noninteractive.rounding = rounding;
+
+    // Inativo (botões/combos parados).
+    v.widgets.inactive.bg_fill = SURFACE;
+    v.widgets.inactive.weak_bg_fill = SURFACE;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT_MAIN);
+    v.widgets.inactive.rounding = rounding;
+
+    // Hover (mouse em cima).
+    v.widgets.hovered.bg_fill = SURFACE_HOVER;
+    v.widgets.hovered.weak_bg_fill = SURFACE_HOVER;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT_MAIN);
+    v.widgets.hovered.rounding = rounding;
+
+    // Ativo (clique/seleção).
+    v.widgets.active.bg_fill = ACCENT;
+    v.widgets.active.weak_bg_fill = ACCENT;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT_HOVER);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, TEXT_MAIN);
+    v.widgets.active.rounding = rounding;
+
+    // Aberto (combo aberto).
+    v.widgets.open.bg_fill = SURFACE_HOVER;
+    v.widgets.open.weak_bg_fill = SURFACE_HOVER;
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    v.widgets.open.fg_stroke = egui::Stroke::new(1.0, TEXT_MAIN);
+    v.widgets.open.rounding = rounding;
+
+    style.visuals = v;
+
+    // Espaçamentos respiráveis (>= 8px entre itens; padding generoso nos botões).
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.window_margin = egui::Margin::same(14.0);
+    style.spacing.interact_size.y = 26.0;
+
+    // Tipografia sem serifa, um pouco maior, para respiro e leitura.
+    style.text_styles = [
+        (egui::TextStyle::Heading, egui::FontId::new(22.0, egui::FontFamily::Proportional)),
+        (egui::TextStyle::Body, egui::FontId::new(15.0, egui::FontFamily::Proportional)),
+        (egui::TextStyle::Button, egui::FontId::new(15.0, egui::FontFamily::Proportional)),
+        (egui::TextStyle::Small, egui::FontId::new(12.5, egui::FontFamily::Proportional)),
+        (egui::TextStyle::Monospace, egui::FontId::new(13.5, egui::FontFamily::Monospace)),
+    ]
+    .into();
+
+    ctx.set_style(style);
+}
+
+/// Carrega fontes modernas do sistema (Segoe UI / Consolas no Windows) e as coloca
+/// à frente das fontes padrão do egui — que permanecem como fallback (inclusive emojis).
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut changed = false;
+
+    // Proporcional: Segoe UI (Windows). Fallback do egui cobre emojis/ícones.
+    let sans = [r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\SegoeUI.ttf"];
+    if let Some(bytes) = sans.iter().find_map(|p| std::fs::read(p).ok()) {
+        fonts
+            .font_data
+            .insert("ui-sans".to_owned(), egui::FontData::from_owned(bytes));
+        if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            fam.insert(0, "ui-sans".to_owned());
+        }
+        changed = true;
+    }
+
+    // Monoespaçada: Consolas (para blocos de código/saída).
+    let mono = [r"C:\Windows\Fonts\consola.ttf"];
+    if let Some(bytes) = mono.iter().find_map(|p| std::fs::read(p).ok()) {
+        fonts
+            .font_data
+            .insert("ui-mono".to_owned(), egui::FontData::from_owned(bytes));
+        if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            fam.insert(0, "ui-mono".to_owned());
+        }
+        changed = true;
+    }
+
+    if changed {
+        ctx.set_fonts(fonts);
+    }
+}
+
 const MAX_AGENT_STEPS: usize = 16;
 
 const AGENT_SYSTEM: &str = r##"Você é o Abyss AI — um APLICATIVO desktop nativo (escrito em Rust + egui) que roda no PC Windows do usuário. Você CONVERSA e também EXECUTA tarefas reais na máquina.
@@ -102,7 +314,12 @@ A cada mensagem, decida você mesmo o que fazer:
 Você tem acesso ao COMPUTADOR INTEIRO (qualquer pasta/arquivo do Windows) e pode:
 - ler arquivos (para entender antes de editar),
 - criar/editar QUALQUER tipo de arquivo de texto (código, config, .md, .json, .html, etc.),
-- executar comandos PowerShell.
+- executar comandos PowerShell,
+- NAVEGAR e BUSCAR NA WEB pelo Microsoft Edge (você "domina" o Edge):
+  · action="open_url" → ABRE a página no Microsoft Edge (janela visível para o usuário) e você JÁ RECEBE o texto da página para usar. Use quando o usuário disser "acesse/abra/entra em <site>".
+  · action="web_search" → BUSCA na web (Bing, o buscador do Edge): abre os resultados no Edge E você recebe a lista (título + link + trecho) para escolher e seguir. Use quando precisar PROCURAR algo, achar um site, ou pegar informação atual da internet.
+  · action="read_url" → LÊ o conteúdo de uma URL em segundo plano (sem abrir janela), útil para abrir vários links de uma busca sem encher a tela de janelas.
+  IMPORTANTE: para a web use SEMPRE estas ações (nunca tente abrir o navegador via "run"/Start-Process; o navegador é SEMPRE o Microsoft Edge). Quando precisar de fato atual/recente, NÃO invente: faça web_search e leia os resultados.
 
 Sobre pastas (NÃO existe pasta fixa de trabalho):
 - Você começa na PASTA ATUAL informada abaixo (a pasta pessoal do usuário), mas pode trabalhar em QUALQUER pasta do PC.
@@ -112,10 +329,12 @@ Sobre pastas (NÃO existe pasta fixa de trabalho):
 
 Para CADA passo responda SOMENTE com um objeto JSON:
 - "explanation": em português. Num passo de tarefa: 1-2 frases do que fará neste passo (ou o resumo final). Numa resposta a pergunta/conversa: escreva aqui a RESPOSTA COMPLETA (pode ser longa, com blocos ```).
-- "action": "read_file" | "write_file" | "run" | "change_dir" | "finish".
+- "action": "read_file" | "write_file" | "run" | "change_dir" | "web_search" | "open_url" | "read_url" | "finish".
 - "path": caminho do arquivo (read_file/write_file) ou da pasta (change_dir). Relativo resolve na pasta atual; absoluto vai direto.
 - "content": o conteúdo COMPLETO e final do arquivo (apenas para write_file; sobrescreve o arquivo inteiro — NÃO use diffs/trechos).
 - "powershell": o comando (apenas para action="run").
+- "url": o endereço completo (com https://) — apenas para open_url e read_url.
+- "query": o que buscar na web — apenas para web_search.
 - "task_complete": true quando a tarefa inteira terminou (ou quando foi só conversa/pergunta).
 
 Depois de cada passo você recebe o resultado (saída do comando, conteúdo do arquivo, ou confirmação de escrita) e decide o próximo.
@@ -127,7 +346,8 @@ Regras:
 - Faça UM passo objetivo por vez. Não invente caminhos; use read_file ou "run" (ex.: Get-ChildItem) para descobrir.
 - Se for só conversa/pergunta/saudação ("olá"), responda completo na "explanation", com action="finish" e task_complete=true.
 - Se o usuário enviar uma IMAGEM ou a TRANSCRIÇÃO de um áudio, analise/descreva e responda ao que ele pediu sobre aquele conteúdo.
-- Ao terminar uma tarefa, action="finish", path/content/powershell vazios, task_complete=true, e um resumo na "explanation"."##;
+- WEB: "acesse/abra <site>" → open_url com a URL completa. "procure/pesquise/busque <x>", "ache o site de <x>", "veja a notícia de <x>" ou qualquer coisa que dependa de informação ATUAL da internet → web_search e depois, se precisar, read_url/open_url num dos links. Sempre pelo Microsoft Edge.
+- Ao terminar uma tarefa, action="finish", path/content/powershell/url/query vazios, task_complete=true, e um resumo na "explanation"."##;
 
 // ----------------------------- Catálogo de modelos -----------------------------
 
@@ -136,8 +356,16 @@ fn is_gemini(id: &str) -> bool {
     id.starts_with("gemini")
 }
 
+/// É um modelo servido pelo OpenRouter? (lista explícita + heurística: ids gratuitos terminam em ":free")
+fn is_openrouter(id: &str) -> bool {
+    OPENROUTER_CHAT_MODELS.contains(&id) || id.ends_with(":free")
+}
+
 /// É um modelo servido pela Groq? (lista explícita + heurística para ids digitados à mão)
 fn is_groq(id: &str) -> bool {
+    if is_openrouter(id) {
+        return false; // ids ":free" são do OpenRouter, não da Groq
+    }
     GROQ_CHAT_MODELS.contains(&id)
         || GROQ_VISION_MODELS.contains(&id)
         || GROQ_AUDIO_MODELS.contains(&id)
@@ -161,7 +389,10 @@ fn is_vision(id: &str) -> bool {
 
 /// O modelo serve como CHAT de texto? (exclui Whisper/Orpheus/segurança)
 fn is_chat_capable(id: &str) -> bool {
-    is_gemini(id) || GROQ_CHAT_MODELS.contains(&id) || GROQ_VISION_MODELS.contains(&id)
+    is_gemini(id)
+        || GROQ_CHAT_MODELS.contains(&id)
+        || GROQ_VISION_MODELS.contains(&id)
+        || is_openrouter(id)
 }
 
 /// Nome amigável exibido na UI.
@@ -188,6 +419,16 @@ fn model_label(id: &str) -> String {
         "meta-llama/llama-prompt-guard-2-22m" => "Llama Prompt Guard 2 22M",
         "meta-llama/llama-prompt-guard-2-86m" => "Llama Prompt Guard 2 86M",
         "openai/gpt-oss-safeguard-20b" => "Safety GPT-OSS 20B",
+        "openai/gpt-oss-20b:free" => "GPT-OSS 20B (grátis)",
+        "moonshotai/kimi-k2.6:free" => "Kimi K2.6 (grátis)",
+        "google/gemma-4-31b-it:free" => "Gemma 4 31B (grátis)",
+        "z-ai/glm-4.5-air:free" => "GLM 4.5 Air (grátis)",
+        "nvidia/nemotron-3-super-120b-a12b:free" => "Nemotron 3 Super 120B (grátis)",
+        "nvidia/nemotron-nano-9b-v2:free" => "Nemotron Nano 9B (grátis)",
+        "meta-llama/llama-3.3-70b-instruct:free" => "Llama 3.3 70B (grátis)",
+        "qwen/qwen3-next-80b-a3b-instruct:free" => "Qwen3 Next 80B (grátis)",
+        "qwen/qwen3-coder:free" => "Qwen3 Coder (grátis)",
+        "meta-llama/llama-3.2-3b-instruct:free" => "Llama 3.2 3B (grátis)",
         _ => id,
     };
     s.to_string()
@@ -223,6 +464,16 @@ fn model_desc(id: &str) -> &'static str {
             "Meta · Groq · detecção de injeção de prompt/toxicidade (modelo maior)."
         }
         "openai/gpt-oss-safeguard-20b" => "OpenAI · Groq · moderação de conteúdo em tempo real.",
+        "openai/gpt-oss-20b:free" => "OpenAI · OpenRouter · grátis · rápido e responde na hora.",
+        "moonshotai/kimi-k2.6:free" => "Moonshot · OpenRouter · grátis · forte em uso geral.",
+        "google/gemma-4-31b-it:free" => "Google · OpenRouter · grátis · bom para tarefas diretas.",
+        "z-ai/glm-4.5-air:free" => "Z-AI · OpenRouter · grátis · assistente geral leve.",
+        "nvidia/nemotron-3-super-120b-a12b:free" => "NVIDIA · OpenRouter · grátis · raciocínio (modelo grande; pode dar limite).",
+        "nvidia/nemotron-nano-9b-v2:free" => "NVIDIA · OpenRouter · grátis · leve e rápido.",
+        "meta-llama/llama-3.3-70b-instruct:free" => "Meta · OpenRouter · grátis · alta capacidade (pode dar limite).",
+        "qwen/qwen3-next-80b-a3b-instruct:free" => "Alibaba · OpenRouter · grátis · lógica e contexto longo (pode dar limite).",
+        "qwen/qwen3-coder:free" => "Alibaba · OpenRouter · grátis · focado em código (pode dar limite).",
+        "meta-llama/llama-3.2-3b-instruct:free" => "Meta · OpenRouter · grátis · leve e rápido.",
         _ => "",
     }
 }
@@ -286,6 +537,8 @@ enum WorkerMsg {
     ImagePicked(ImageAttachment),
     /// Áudio escolhido e transcrito por Whisper: (nome do arquivo, texto).
     AudioTranscribed { name: String, text: String },
+    /// Arquivo/documento escolhido: (nome, conteúdo já extraído como texto).
+    FilePicked { name: String, content: String },
     /// Erro ao escolher/ler/transcrever um anexo.
     PickError(String),
     /// O usuário cancelou o seletor de arquivos.
@@ -304,6 +557,7 @@ struct App {
     convo: ModeState,
     api_key: String,
     groq_key: String,
+    openrouter_key: String,
     model: String,
     auto_run: bool,
     show_settings: bool,
@@ -312,6 +566,7 @@ struct App {
     status: Option<String>,
     pending_image: Option<ImageAttachment>,
     pending_audio: Option<(String, String)>, // (nome, transcrição)
+    pending_file: Option<(String, String)>,  // (nome, conteúdo extraído)
     memory: Vec<MemoryEntry>,
     mem_path: std::path::PathBuf,
     next_mem_id: u64,
@@ -324,11 +579,14 @@ struct App {
     tx: mpsc::Sender<WorkerMsg>,
     rx: mpsc::Receiver<WorkerMsg>,
     http: ureq::Agent,
+    /// Textura da logo (carregada sob demanda) para a marca d'água do empty state.
+    logo_tex: Option<egui::TextureHandle>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        apply_abyss_theme(&cc.egui_ctx); // tema "Abyssal Dark Blue"
+        install_fonts(&cc.egui_ctx); // fontes modernas (Segoe UI / Consolas)
         let (tx, rx) = mpsc::channel();
         let connector = native_tls::TlsConnector::new().expect("falha ao criar TLS (SChannel)");
         let http = ureq::AgentBuilder::new()
@@ -353,6 +611,7 @@ impl App {
             convo: ModeState::default(),
             api_key: DEFAULT_API_KEY.to_string(),
             groq_key: DEFAULT_GROQ_KEY.to_string(),
+            openrouter_key: DEFAULT_OPENROUTER_KEY.to_string(),
             model: DEFAULT_MODEL.to_string(),
             auto_run: true,
             show_settings: false,
@@ -361,6 +620,7 @@ impl App {
             status: None,
             pending_image: None,
             pending_audio: None,
+            pending_file: None,
             memory,
             mem_path,
             next_mem_id,
@@ -372,7 +632,118 @@ impl App {
             tx,
             rx,
             http,
+            logo_tex: None,
         }
+    }
+
+    /// Carrega (uma vez) a logo embutida como textura para a marca d'água do empty state.
+    fn logo_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if self.logo_tex.is_none() {
+            let png = include_bytes!("../assets/abyss.png");
+            if let Ok(img) = image::load_from_memory(png) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let color =
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+                self.logo_tex =
+                    Some(ctx.load_texture("abyss_logo", color, egui::TextureOptions::LINEAR));
+            }
+        }
+        self.logo_tex.clone()
+    }
+
+    /// Janela flutuante de Configurações (chaves de API, modelo, auto-update, memória, contexto).
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new(egui::RichText::new("⚙  Configurações").strong())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 58.0))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
+
+                section_label(ui, "🔑 Chaves de API");
+                key_row(ui, "Gemini", &mut self.api_key);
+                key_row(ui, "Groq", &mut self.groq_key);
+                key_row(ui, "OpenRouter", &mut self.openrouter_key);
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [96.0, 24.0],
+                        egui::Label::new(egui::RichText::new("Modelo").color(theme::TEXT_MUTED)),
+                    );
+                    ui.add(egui::TextEdit::singleline(&mut self.model).desired_width(300.0));
+                });
+
+                ui.add_space(2.0);
+                ui.separator();
+                section_label(ui, "🔄 Auto-update");
+                ui.label(
+                    egui::RichText::new(
+                        "O Abyss edita o próprio código, compila e promove a nova versão se passar. \
+                         Escreva no campo de mensagem o QUE mudar e clique no botão.",
+                    )
+                    .small()
+                    .color(theme::TEXT_MUTED),
+                );
+                if ui
+                    .add_enabled(
+                        !self.pending,
+                        egui::Button::new(
+                            egui::RichText::new("🔄 Atualizar o Abyss AI").color(theme::TEXT_MAIN),
+                        )
+                        .fill(theme::ACCENT),
+                    )
+                    .clicked()
+                {
+                    self.start_self_update(ctx);
+                }
+
+                ui.add_space(2.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    section_label(ui, &format!("🧠 Memória ({})", self.memory.len()));
+                    if !self.memory.is_empty() && ui.small_button("Limpar tudo").clicked() {
+                        self.clear_memory();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Diga no chat: \"salve isso na memória ...\"")
+                        .small()
+                        .color(theme::TEXT_MUTED),
+                );
+                let mut remove_id: Option<u64> = None;
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for m in &self.memory {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("✕").clicked() {
+                                    remove_id = Some(m.id);
+                                }
+                                ui.label(egui::RichText::new(m.text.as_str()).small());
+                            });
+                        }
+                    });
+                if let Some(id) = remove_id {
+                    self.remove_memory(id);
+                }
+
+                ui.add_space(2.0);
+                ui.separator();
+                section_label(ui, "📝 Contexto");
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · registro literal do chat (zera ao reabrir ou em 🗑 Limpar)",
+                        human_size(self.context_md.len())
+                    ))
+                    .small()
+                    .color(theme::TEXT_MUTED),
+                );
+            });
+        self.show_settings = open;
     }
 
     fn cur_mut(&mut self) -> &mut ModeState {
@@ -440,7 +811,9 @@ impl App {
 
     fn send(&mut self, ctx: &egui::Context) {
         let text = self.input.trim().to_string();
-        let has_attach = self.pending_image.is_some() || self.pending_audio.is_some();
+        let has_attach = self.pending_image.is_some()
+            || self.pending_audio.is_some()
+            || self.pending_file.is_some();
         if (text.is_empty() && !has_attach) || self.pending {
             return;
         }
@@ -458,10 +831,13 @@ impl App {
             }
         }
 
-        if self.api_key.trim().is_empty() && self.groq_key.trim().is_empty() {
+        if self.api_key.trim().is_empty()
+            && self.groq_key.trim().is_empty()
+            && self.openrouter_key.trim().is_empty()
+        {
             self.cur_mut().transcript.push(Msg::new(
                 Role::Error,
-                "Configure uma API Key (Gemini ou Groq) em ⚙ Configurações.",
+                "Configure uma API Key (Gemini, Groq ou OpenRouter) em ⚙ Configurações.",
             ));
             return;
         }
@@ -469,6 +845,7 @@ impl App {
 
         let image = self.pending_image.take();
         let audio = self.pending_audio.take();
+        let file = self.pending_file.take();
 
         // Texto exibido na conversa (com marcadores de anexo).
         let mut display = text.clone();
@@ -484,8 +861,14 @@ impl App {
             }
             display.push_str(&format!("🎵 áudio anexado: {name}"));
         }
+        if let Some((name, _)) = &file {
+            if !display.is_empty() {
+                display.push('\n');
+            }
+            display.push_str(&format!("📎 arquivo anexado: {name}"));
+        }
 
-        // Texto enviado ao modelo: o áudio entra como transcrição; a imagem vai separada.
+        // Texto enviado ao modelo: áudio vira transcrição, arquivo vira conteúdo extraído, imagem vai separada.
         let mut htext = text.clone();
         if let Some((name, tr)) = &audio {
             if !htext.trim().is_empty() {
@@ -494,6 +877,19 @@ impl App {
             htext.push_str(&format!(
                 "[Áudio enviado \"{name}\" — transcrição automática por Whisper]:\n{tr}"
             ));
+        }
+        if let Some((name, content)) = &file {
+            if !htext.trim().is_empty() {
+                htext.push_str("\n\n");
+            }
+            htext.push_str(&format!(
+                "[Arquivo enviado \"{name}\" — conteúdo extraído]:\n{content}"
+            ));
+        }
+        if text.trim().is_empty() && (file.is_some() || audio.is_some()) {
+            htext = format!(
+                "Analise e resuma o conteúdo que eu enviei e responda em português.\n\n{htext}"
+            );
         }
         if htext.trim().is_empty() {
             htext = if image.is_some() {
@@ -520,6 +916,7 @@ impl App {
         let http = self.http.clone();
         let gkey = self.api_key.trim().to_string();
         let qkey = self.groq_key.trim().to_string();
+        let okey = self.openrouter_key.trim().to_string();
         // Roteamento: imagem → modelos com visão; senão → modelos de chat (selecionado primeiro).
         let models = if image.is_some() {
             vision_models(self.model.trim())
@@ -554,7 +951,7 @@ impl App {
         self.convo.history.push(("user".into(), htext));
         let history = self.convo.history.clone();
         let auto = self.auto_run;
-        spawn_agent(ctx2, tx, http, gkey, qkey, models, system, history, work_dir, auto, image);
+        spawn_agent(ctx2, tx, http, gkey, qkey, okey, models, system, history, work_dir, auto, image);
     }
 
     fn start_self_update(&mut self, ctx: &egui::Context) {
@@ -569,10 +966,14 @@ impl App {
             ));
             return;
         }
-        if self.api_key.trim().is_empty() && self.groq_key.trim().is_empty() {
-            self.convo
-                .transcript
-                .push(Msg::new(Role::Error, "Configure uma API Key (Gemini ou Groq) em ⚙ Configurações."));
+        if self.api_key.trim().is_empty()
+            && self.groq_key.trim().is_empty()
+            && self.openrouter_key.trim().is_empty()
+        {
+            self.convo.transcript.push(Msg::new(
+                Role::Error,
+                "Configure uma API Key (Gemini, Groq ou OpenRouter) em ⚙ Configurações.",
+            ));
             return;
         }
         self.input.clear();
@@ -586,6 +987,7 @@ impl App {
             self.http.clone(),
             self.api_key.trim().to_string(),
             self.groq_key.trim().to_string(),
+            self.openrouter_key.trim().to_string(),
             ordered_models(self.model.trim()),
             self.memory_preamble(),
             instruction,
@@ -631,6 +1033,10 @@ impl App {
                     self.picking = false;
                     self.pending_audio = Some((name, text));
                 }
+                WorkerMsg::FilePicked { name, content } => {
+                    self.picking = false;
+                    self.pending_file = Some((name, content));
+                }
                 WorkerMsg::PickError(e) => {
                     self.picking = false;
                     self.convo.transcript.push(Msg::new(Role::Error, e));
@@ -647,259 +1053,183 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
 
-        // ----- Topo: título, ações, seletor de modelos, configurações -----
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("Abyss AI");
-                ui.separator();
-                ui.label(
-                    egui::RichText::new("pergunte, mande fazer, ou anexe imagem/áudio").weak(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🗑 Limpar").clicked() {
-                        self.clear_current();
-                    }
-                    if ui.button("⚙").on_hover_text("Configurações").clicked() {
-                        self.show_settings = !self.show_settings;
-                    }
-                    if self.pending {
-                        if let Some(s) = &self.status {
-                            ui.label(
-                                egui::RichText::new(s.as_str())
-                                    .color(egui::Color32::from_rgb(220, 160, 60)),
-                            );
-                        } else {
-                            ui.label("processando…");
-                        }
-                        ui.spinner();
-                    }
-                    ui.add_space(8.0);
-                    egui::ComboBox::from_id_source("model_sel")
-                        .selected_text(model_label(&self.model))
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            group_label(ui, "Gemini · Flash — rápidos, cota maior");
-                            for &m in FLASH_MODELS {
-                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
-                                    .on_hover_text(model_desc(m));
-                            }
-                            ui.separator();
-                            group_label(ui, "Gemini · Pro — raciocínio, cota baixa");
-                            for &m in PRO_MODELS {
-                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
-                                    .on_hover_text(model_desc(m));
-                            }
-                            ui.separator();
-                            group_label(ui, "Groq · texto, raciocínio e código");
-                            for &m in GROQ_CHAT_MODELS {
-                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
-                                    .on_hover_text(model_desc(m));
-                            }
-                            ui.separator();
-                            group_label(ui, "Groq · visão (envie imagens)");
-                            for &m in GROQ_VISION_MODELS {
-                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
-                                    .on_hover_text(model_desc(m));
-                            }
-                            ui.separator();
-                            group_label(ui, "Groq · áudio → texto (Whisper)");
-                            for &m in GROQ_AUDIO_MODELS {
-                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
-                                    .on_hover_text(model_desc(m));
-                            }
-                            ui.separator();
-                            group_label(ui, "Groq · voz (Orpheus / TTS)");
-                            for &m in GROQ_TTS_MODELS {
-                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
-                                    .on_hover_text(model_desc(m));
-                            }
-                            ui.separator();
-                            group_label(ui, "Groq · segurança / moderação");
-                            for &m in GROQ_SAFETY_MODELS {
-                                ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
-                                    .on_hover_text(model_desc(m));
-                            }
-                        });
-                    ui.label(egui::RichText::new("Modelos:").weak());
-                });
-            });
+        // ----- Janela flutuante de Configurações (⚙) -----
+        self.settings_window(ctx);
 
-            // Linha de descrição do modelo selecionado + aviso de roteamento automático.
-            ui.horizontal_wrapped(|ui| {
-                let prov = if is_groq(&self.model) { "Groq" } else { "Google Gemini" };
-                ui.label(
-                    egui::RichText::new(format!("▸ {} · {}", model_label(&self.model), prov))
-                        .small()
-                        .strong()
-                        .color(egui::Color32::from_rgb(150, 180, 220)),
-                );
-                let d = model_desc(&self.model);
-                if !d.is_empty() {
-                    ui.label(egui::RichText::new(format!("— {d}")).small().weak());
-                }
-                ui.label(
-                    egui::RichText::new("· a IA troca de modelo sozinha (imagem→visão, áudio→Whisper)")
-                        .small()
-                        .weak(),
-                );
-            });
-
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.auto_run, "Executar automaticamente");
-                ui.label(
-                    egui::RichText::new("⚠ roda comandos/edições REAIS · acesso a todo o PC")
-                        .small()
-                        .color(egui::Color32::from_rgb(220, 160, 60)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!self.pending, egui::Button::new("🔄 Auto-update Abyss AI"))
-                        .on_hover_text(
-                            "Salva no Git, edita uma cópia (updateabyss), compila e promove se passar.\n\
-                             Escreva no campo de baixo O QUE mudar e clique aqui.",
-                        )
-                        .clicked()
-                    {
-                        self.start_self_update(ctx);
-                    }
-                });
-            });
-
-            if self.show_settings {
-                ui.add_space(2.0);
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("API Key Gemini:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.api_key)
-                                .password(true)
-                                .desired_width(360.0),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("API Key Groq:  ");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.groq_key)
-                                .password(true)
-                                .desired_width(360.0),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Modelo: ");
-                        ui.add(egui::TextEdit::singleline(&mut self.model).desired_width(240.0));
-                    });
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(format!("🧠 Memória ({})", self.memory.len()));
-                        ui.label(
-                            egui::RichText::new("— diga: \"salve isso na memória ...\"")
-                                .small()
-                                .weak(),
-                        );
-                        if !self.memory.is_empty() && ui.button("Limpar tudo").clicked() {
-                            self.clear_memory();
-                        }
-                    });
-                    let mut remove_id: Option<u64> = None;
-                    egui::ScrollArea::vertical()
-                        .max_height(150.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for m in &self.memory {
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("✕").clicked() {
-                                        remove_id = Some(m.id);
-                                    }
-                                    ui.label(egui::RichText::new(m.text.as_str()).small());
-                                });
-                            }
-                        });
-                    if let Some(id) = remove_id {
-                        self.remove_memory(id);
-                    }
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(format!("📝 Contexto: {}", human_size(self.context_md.len())));
-                        ui.label(
-                            egui::RichText::new(
-                                "— registro literal do chat (sem IA); zera ao fechar/abrir ou em 🗑 Limpar",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    });
+        // ----- Topo (enxuto): logo à esquerda · seletor + ações à direita -----
+        egui::TopBottomPanel::top("top")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::BG_PANEL)
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Logo / título.
+                    ui.label(egui::RichText::new("🌀").size(22.0).color(theme::CYAN));
+                    ui.add_space(2.0);
                     ui.label(
-                        egui::RichText::new(self.context_path.display().to_string())
-                            .small()
-                            .weak(),
+                        egui::RichText::new("Abyss AI")
+                            .size(20.0)
+                            .strong()
+                            .color(theme::TEXT_MAIN),
                     );
+
+                    // Grupo à direita: seletor de modelos, ⚙ e 🗑 (+ status quando processando).
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(egui::RichText::new("🗑").size(15.0))
+                            .on_hover_text("Limpar conversa")
+                            .clicked()
+                        {
+                            self.clear_current();
+                        }
+                        ui.add_space(2.0);
+                        if ui
+                            .button(egui::RichText::new("⚙").size(15.0))
+                            .on_hover_text("Configurações")
+                            .clicked()
+                        {
+                            self.show_settings = !self.show_settings;
+                        }
+                        ui.add_space(8.0);
+
+                        // Seletor de modelos (flat). O tooltip explica o roteamento automático.
+                        let combo = egui::ComboBox::from_id_source("model_sel")
+                            .selected_text(model_label(&self.model))
+                            .width(210.0)
+                            .show_ui(ui, |ui| {
+                                // Tier list: mais inteligente no topo → mais simples embaixo
+                                // (todos os provedores misturados). O hover mostra o que cada um faz.
+                                let tier = |ui: &mut egui::Ui, model: &mut String, label: &str, ids: &[&str]| {
+                                    group_label(ui, label);
+                                    for &m in ids {
+                                        ui.selectable_value(model, m.to_string(), model_label(m))
+                                            .on_hover_text(model_desc(m));
+                                    }
+                                };
+                                tier(ui, &mut self.model, "🥇 Topo — raciocínio mais profundo", TIER_TOP);
+                                ui.separator();
+                                tier(ui, &mut self.model, "🥈 Muito capazes", TIER_STRONG);
+                                ui.separator();
+                                tier(ui, &mut self.model, "🥉 Equilibrados — qualidade e rapidez", TIER_BALANCED);
+                                ui.separator();
+                                tier(ui, &mut self.model, "⚡ Rápidos e leves", TIER_FAST);
+                                ui.separator();
+                                group_label(ui, "🎵 Áudio → texto (Whisper) · automático");
+                                for &m in GROQ_AUDIO_MODELS {
+                                    ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                        .on_hover_text(model_desc(m));
+                                }
+                                ui.separator();
+                                group_label(ui, "🔊 Voz (Orpheus / TTS)");
+                                for &m in GROQ_TTS_MODELS {
+                                    ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                        .on_hover_text(model_desc(m));
+                                }
+                                ui.separator();
+                                group_label(ui, "🛡 Segurança / moderação");
+                                for &m in GROQ_SAFETY_MODELS {
+                                    ui.selectable_value(&mut self.model, m.to_string(), model_label(m))
+                                        .on_hover_text(model_desc(m));
+                                }
+                            });
+                        // Tooltip do seletor: provedor, descrição e aviso de troca automática.
+                        let prov = if is_openrouter(&self.model) {
+                            "OpenRouter"
+                        } else if is_groq(&self.model) {
+                            "Groq"
+                        } else {
+                            "Google Gemini"
+                        };
+                        let mut tip = format!("{} · {}", model_label(&self.model), prov);
+                        let d = model_desc(&self.model);
+                        if !d.is_empty() {
+                            tip.push('\n');
+                            tip.push_str(d);
+                        }
+                        tip.push_str(
+                            "\n\nA IA troca de modelo sozinha conforme a tarefa (imagem → visão, \
+                             áudio → Whisper) e cai para outro modelo se um bater o limite.",
+                        );
+                        combo.response.on_hover_text(tip);
+
+                        // Status de processamento, à esquerda do seletor.
+                        if self.pending {
+                            ui.add_space(8.0);
+                            let s = self
+                                .status
+                                .clone()
+                                .unwrap_or_else(|| "processando…".to_string());
+                            ui.label(egui::RichText::new(s).small().color(theme::WARN));
+                            ui.spinner();
+                        }
+                    });
                 });
-            }
-            ui.add_space(4.0);
-        });
+            });
 
-        // ----- Rodapé: anexos + campo de entrada + botão enviar -----
-        egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
-            ui.add_space(6.0);
-
-            // Linha de anexos: imagem (visão) e áudio/música (Whisper → texto).
-            ui.horizontal(|ui| {
+        // ----- Rodapé: toggle de execução + barra de input (anexo · texto · enviar) -----
+        egui::TopBottomPanel::bottom("input")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::BG_PANEL)
+                    .inner_margin(egui::Margin::symmetric(16.0, 12.0)),
+            )
+            .show(ctx, |ui| {
                 let busy = self.pending || self.picking;
-                if ui
-                    .add_enabled(!busy, egui::Button::new("🖼 Imagem"))
-                    .on_hover_text("Anexar uma imagem para a IA analisar (usa um modelo com visão).")
-                    .clicked()
-                {
-                    self.picking = true;
-                    spawn_pick_image(ctx.clone(), self.tx.clone());
-                }
-                let groq_ok = !self.groq_key.trim().is_empty();
-                let ab = ui.add_enabled(!busy && groq_ok, egui::Button::new("🎵 Áudio/Música"));
-                let ab = ab.on_hover_text(if groq_ok {
-                    "Anexar música/áudio: é transcrito (Whisper/Groq) e enviado como texto à IA."
-                } else {
-                    "Configure a API Key Groq em ⚙ para transcrever áudio (Whisper)."
-                });
-                if ab.clicked() {
-                    self.picking = true;
-                    spawn_pick_audio(
-                        ctx.clone(),
-                        self.tx.clone(),
-                        self.http.clone(),
-                        self.groq_key.trim().to_string(),
-                        whisper_model(self.model.trim()).to_string(),
-                    );
-                }
-                if self.picking {
-                    ui.spinner();
-                    ui.label(egui::RichText::new("processando anexo…").small().weak());
-                }
+
+                // ----- Chips dos anexos pendentes (acima da barra) -----
                 let mut clear_img = false;
                 let mut clear_aud = false;
-                if let Some(img) = &self.pending_image {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("🖼 {}", img.name))
-                            .small()
-                            .color(egui::Color32::from_rgb(150, 200, 255)),
-                    );
-                    if ui.small_button("✕").clicked() {
-                        clear_img = true;
-                    }
-                }
-                if let Some((name, _)) = &self.pending_audio {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("🎵 {name} (transcrito)"))
-                            .small()
-                            .color(egui::Color32::from_rgb(180, 220, 150)),
-                    );
-                    if ui.small_button("✕").clicked() {
-                        clear_aud = true;
-                    }
+                let mut clear_file = false;
+                let has_chip = self.picking
+                    || self.pending_image.is_some()
+                    || self.pending_audio.is_some()
+                    || self.pending_file.is_some();
+                if has_chip {
+                    ui.horizontal(|ui| {
+                        if self.picking {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("processando anexo…")
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                        }
+                        if let Some(img) = &self.pending_image {
+                            ui.label(
+                                egui::RichText::new(format!("🖼 {}", img.name))
+                                    .small()
+                                    .color(theme::ACCENT_HOVER),
+                            );
+                            if ui.small_button("✕").clicked() {
+                                clear_img = true;
+                            }
+                            ui.add_space(6.0);
+                        }
+                        if let Some((name, _)) = &self.pending_audio {
+                            ui.label(
+                                egui::RichText::new(format!("🎵 {name} (transcrito)"))
+                                    .small()
+                                    .color(theme::CYAN),
+                            );
+                            if ui.small_button("✕").clicked() {
+                                clear_aud = true;
+                            }
+                            ui.add_space(6.0);
+                        }
+                        if let Some((name, _)) = &self.pending_file {
+                            ui.label(
+                                egui::RichText::new(format!("📎 {name}"))
+                                    .small()
+                                    .color(theme::WARN),
+                            );
+                            if ui.small_button("✕").clicked() {
+                                clear_file = true;
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
                 }
                 if clear_img {
                     self.pending_image = None;
@@ -907,45 +1237,230 @@ impl eframe::App for App {
                 if clear_aud {
                     self.pending_audio = None;
                 }
-            });
-
-            let hint = "Pergunte, mande fazer algo, ou anexe imagem/áudio acima…  (Enter envia)";
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.input)
-                    .hint_text(hint)
-                    .desired_width(f32::INFINITY),
-            );
-            // Enter envia a mensagem; mantém o foco para continuar digitando.
-            let enter_send = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.add_space(4.0);
-            let mut do_send = false;
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.pending, egui::Button::new("Enviar  ➤")).clicked() {
-                    do_send = true;
+                if clear_file {
+                    self.pending_file = None;
                 }
-                ui.label(
-                    egui::RichText::new(format!("Abyss AI  ·  {}", model_label(&self.model))).weak(),
-                );
-            });
-            if (do_send || enter_send) && !self.pending {
-                self.send(ctx);
-                resp.request_focus();
-            }
-            ui.add_space(6.0);
-        });
 
-        // ----- Centro: transcrição da conversa -----
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let transcript = &self.convo.transcript;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for m in transcript {
-                        draw_msg(ui, m);
+                // ----- Toggle moderno "Executar automaticamente" + selo de aviso -----
+                ui.horizontal(|ui| {
+                    let resp = toggle_switch(ui, &mut self.auto_run);
+                    resp.on_hover_text(
+                        "Quando ligado, o Abyss roda comandos e edita arquivos REAIS no seu PC \
+                         automaticamente. Desligado, ele apenas responde.",
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Executar automaticamente").color(theme::TEXT_MAIN),
+                    );
+                    ui.add_space(6.0);
+                    if self.auto_run {
+                        badge(ui, "⚠ roda comandos REAIS · acesso total ao PC", theme::WARN);
+                    } else {
+                        badge(ui, "🔒 modo seguro · só responde", theme::TEXT_MUTED);
                     }
                 });
-        });
+                ui.add_space(8.0);
+
+                // ----- Barra "pill": (+) ……… texto ……… (➤) -----
+                let mut do_send = false;
+                egui::Frame::none()
+                    .fill(theme::BG_ABYSS)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .rounding(egui::Rounding::same(14.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Botão "+" → menu de anexos (abre ACIMA da barra).
+                            let popup_id = ui.make_persistent_id("attach_menu");
+                            let plus = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("➕").size(18.0).color(theme::TEXT_MUTED),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Anexar imagem, áudio ou arquivo");
+                            if plus.clicked() {
+                                ui.memory_mut(|m| m.toggle_popup(popup_id));
+                            }
+                            egui::popup_above_or_below_widget(
+                                ui,
+                                popup_id,
+                                &plus,
+                                egui::AboveOrBelow::Above,
+                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
+                                    ui.set_min_width(210.0);
+                                    ui.label(
+                                        egui::RichText::new("Anexar").small().color(theme::TEXT_MUTED),
+                                    );
+                                    if ui
+                                        .add_enabled(!busy, egui::Button::new("🖼  Imagem").frame(true))
+                                        .on_hover_text("A IA analisa a imagem (modelo com visão).")
+                                        .clicked()
+                                    {
+                                        self.picking = true;
+                                        spawn_pick_image(ctx.clone(), self.tx.clone());
+                                        ui.memory_mut(|m| m.close_popup());
+                                    }
+                                    let groq_ok = !self.groq_key.trim().is_empty();
+                                    if ui
+                                        .add_enabled(!busy && groq_ok, egui::Button::new("🎵  Áudio / Música").frame(true))
+                                        .on_hover_text(if groq_ok {
+                                            "Transcreve o áudio (Whisper/Groq) e envia como texto."
+                                        } else {
+                                            "Configure a API Key Groq em ⚙ para transcrever áudio."
+                                        })
+                                        .clicked()
+                                    {
+                                        self.picking = true;
+                                        spawn_pick_audio(
+                                            ctx.clone(),
+                                            self.tx.clone(),
+                                            self.http.clone(),
+                                            self.groq_key.trim().to_string(),
+                                            whisper_model(self.model.trim()).to_string(),
+                                        );
+                                        ui.memory_mut(|m| m.close_popup());
+                                    }
+                                    if ui
+                                        .add_enabled(!busy, egui::Button::new("📎  Arquivo / Documento").frame(true))
+                                        .on_hover_text(
+                                            "Excel, Word, PDF, PowerPoint, CSV, TXT, código… O Abyss extrai o texto.",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.picking = true;
+                                        spawn_pick_file(
+                                            ctx.clone(),
+                                            self.tx.clone(),
+                                            self.http.clone(),
+                                            self.groq_key.trim().to_string(),
+                                            whisper_model(self.model.trim()).to_string(),
+                                        );
+                                        ui.memory_mut(|m| m.close_popup());
+                                    }
+                                },
+                            );
+
+                            ui.add_space(6.0);
+                            // Botão enviar (à direita) e o campo de texto preenchendo o meio.
+                            let (resp, send_clicked) = ui
+                                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let can_send = !self.pending
+                                        && (!self.input.trim().is_empty()
+                                            || self.pending_image.is_some()
+                                            || self.pending_audio.is_some()
+                                            || self.pending_file.is_some());
+                                    // Botão enviar: triângulo desenhado (sem depender de glifo de fonte).
+                                    let (send_rect, send) = ui
+                                        .allocate_exact_size(egui::vec2(30.0, 26.0), egui::Sense::click());
+                                    let send_col = if can_send {
+                                        if send.hovered() {
+                                            theme::ACCENT_HOVER
+                                        } else {
+                                            theme::ACCENT
+                                        }
+                                    } else {
+                                        theme::BORDER
+                                    };
+                                    let c = send_rect.center();
+                                    ui.painter().add(egui::Shape::convex_polygon(
+                                        vec![
+                                            egui::pos2(c.x - 6.0, c.y - 7.0),
+                                            egui::pos2(c.x - 6.0, c.y + 7.0),
+                                            egui::pos2(c.x + 8.0, c.y),
+                                        ],
+                                        send_col,
+                                        egui::Stroke::NONE,
+                                    ));
+                                    if can_send && send.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    let send = send.on_hover_text("Enviar (Enter)");
+                                    ui.add_space(4.0);
+                                    let resp = ui.add_sized(
+                                        [ui.available_width(), 26.0],
+                                        egui::TextEdit::singleline(&mut self.input)
+                                            .frame(false)
+                                            .hint_text("Pergunte, mande fazer algo, ou anexe pelo  +"),
+                                    );
+                                    (resp, can_send && send.clicked())
+                                })
+                                .inner;
+
+                            // Enter envia (mantendo o foco para continuar digitando).
+                            let enter_send =
+                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if (send_clicked || enter_send) && !self.pending {
+                                do_send = true;
+                                resp.request_focus();
+                            }
+                        });
+                    });
+
+                if do_send {
+                    self.send(ctx);
+                }
+            });
+
+        // ----- Centro: transcrição da conversa (ou empty state com marca d'água) -----
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::BG_ABYSS)
+                    .inner_margin(egui::Margin::symmetric(18.0, 14.0)),
+            )
+            .show(ctx, |ui| {
+                let logo = self.logo_texture(ctx);
+                let empty = self.convo.transcript.is_empty();
+                if empty && !self.pending {
+                    // Empty state elegante: logo do Abyss como marca d'água sutil + dica.
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() * 0.22);
+                        if let Some(tex) = &logo {
+                            let sized =
+                                egui::load::SizedTexture::new(tex.id(), egui::vec2(150.0, 150.0));
+                            ui.add(
+                                egui::Image::new(sized)
+                                    .fit_to_exact_size(egui::vec2(150.0, 150.0))
+                                    .tint(theme::soft(theme::CYAN, 46)),
+                            );
+                        }
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new("Abyss AI")
+                                .size(28.0)
+                                .strong()
+                                .color(theme::TEXT_MAIN),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Pergunte, mande executar uma tarefa, ou anexe imagem, áudio ou documento.",
+                            )
+                            .color(theme::TEXT_MUTED),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "O Abyss decide sozinho entre responder e agir no seu PC.",
+                            )
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                        );
+                    });
+                } else {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for m in &self.convo.transcript {
+                                draw_msg(ui, m);
+                            }
+                        });
+                }
+            });
     }
 }
 
@@ -1097,10 +1612,12 @@ fn agent_schema() -> serde_json::Value {
         "type": "object",
         "properties": {
             "explanation": { "type": "string" },
-            "action": { "type": "string", "enum": ["run", "write_file", "read_file", "change_dir", "finish"] },
+            "action": { "type": "string", "enum": ["run", "write_file", "read_file", "change_dir", "web_search", "open_url", "read_url", "finish"] },
             "path": { "type": "string" },
             "content": { "type": "string" },
             "powershell": { "type": "string" },
+            "url": { "type": "string" },
+            "query": { "type": "string" },
             "task_complete": { "type": "boolean" }
         },
         "required": ["explanation", "action", "task_complete"]
@@ -1178,13 +1695,44 @@ fn call_one(
     http: &ureq::Agent,
     gemini_key: &str,
     groq_key: &str,
+    openrouter_key: &str,
     model: &str,
     system: &str,
     history: &[(String, String)],
     image: Option<&ImageAttachment>,
     want_json: bool,
 ) -> Result<String, String> {
-    if is_groq(model) {
+    if is_openrouter(model) {
+        if openrouter_key.trim().is_empty() {
+            return Err("sem OpenRouter key".into());
+        }
+        // OpenRouter usa o mesmo formato da OpenAI (igual à Groq).
+        let body = groq_body(model, system, history, image, want_json);
+        let resp = http
+            .post(OPENROUTER_CHAT_URL)
+            .set("Authorization", &format!("Bearer {}", openrouter_key.trim()))
+            // Cabeçalhos recomendados pelo OpenRouter (identificam o app; opcionais).
+            .set("HTTP-Referer", "https://github.com/abyss-ai")
+            .set("X-Title", "Abyss AI")
+            .send_json(body);
+        match resp {
+            Ok(r) => {
+                let v: serde_json::Value =
+                    r.into_json().map_err(|e| format!("resposta inválida: {e}"))?;
+                v.get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| "sem conteúdo".to_string())
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                Err(format!("HTTP {code}: {}", r.into_string().unwrap_or_default()))
+            }
+            Err(e) => Err(format!("rede: {e}")),
+        }
+    } else if is_groq(model) {
         if groq_key.trim().is_empty() {
             return Err("sem Groq key".into());
         }
@@ -1314,26 +1862,38 @@ fn ordered_models(selected: &str) -> Vec<String> {
     if is_chat_capable(selected) {
         v.push(selected.to_string());
     }
-    if is_groq(selected) {
+    // Atalhos para preencher a lista mantendo a ordem certa por provedor.
+    let push_gemini = |v: &mut Vec<String>| {
+        for &m in FLASH_MODELS.iter().chain(PRO_MODELS) {
+            push_unique(v, m);
+        }
+    };
+    let push_groq = |v: &mut Vec<String>| {
         for &m in GROQ_CHAT_MODELS {
-            push_unique(&mut v, m);
+            push_unique(v, m);
         }
         for &m in GROQ_VISION_MODELS {
-            push_unique(&mut v, m);
+            push_unique(v, m);
         }
-        for &m in FLASH_MODELS.iter().chain(PRO_MODELS) {
-            push_unique(&mut v, m);
+    };
+    let push_openrouter = |v: &mut Vec<String>| {
+        for &m in OPENROUTER_CHAT_MODELS {
+            push_unique(v, m);
         }
+    };
+    // Prioriza o provedor do modelo selecionado; os demais entram como fallback.
+    if is_openrouter(selected) {
+        push_openrouter(&mut v);
+        push_groq(&mut v);
+        push_gemini(&mut v);
+    } else if is_groq(selected) {
+        push_groq(&mut v);
+        push_gemini(&mut v);
+        push_openrouter(&mut v);
     } else {
-        for &m in FLASH_MODELS.iter().chain(PRO_MODELS) {
-            push_unique(&mut v, m);
-        }
-        for &m in GROQ_CHAT_MODELS {
-            push_unique(&mut v, m);
-        }
-        for &m in GROQ_VISION_MODELS {
-            push_unique(&mut v, m);
-        }
+        push_gemini(&mut v);
+        push_groq(&mut v);
+        push_openrouter(&mut v);
     }
     if v.is_empty() {
         v.push(DEFAULT_MODEL.to_string());
@@ -1371,6 +1931,7 @@ fn call_resilient(
     http: &ureq::Agent,
     gemini_key: &str,
     groq_key: &str,
+    openrouter_key: &str,
     models: &[String],
     system: &str,
     history: &[(String, String)],
@@ -1383,7 +1944,7 @@ fn call_resilient(
         for model in models {
             // A imagem só vai para modelos com visão.
             let img = if is_vision(model) { image } else { None };
-            if let Ok(text) = call_one(http, gemini_key, groq_key, model, system, history, img, want_json) {
+            if let Ok(text) = call_one(http, gemini_key, groq_key, openrouter_key, model, system, history, img, want_json) {
                 if !text.trim().is_empty() {
                     return text;
                 }
@@ -1770,6 +2331,272 @@ fn tidy_lines(s: &str) -> String {
     out.trim().to_string()
 }
 
+// ----------------------------- Web (navegação/busca via Microsoft Edge) -----------------------------
+
+/// User-Agent de navegador (Edge no Windows) para os GETs parecerem uma aba normal.
+const WEB_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0";
+
+/// Remove o conteúdo de blocos como <script>…</script> (case-insensitive).
+/// Usa to_ascii_lowercase (preserva os offsets de bytes) para fatiar o original com segurança.
+fn strip_html_blocks(html: &str, tag: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0usize;
+    while let Some(rel) = lower[pos..].find(&open) {
+        let start = pos + rel;
+        let after = start + open.len();
+        // Confirma a tag EXATA: o char após o nome deve fechar/abrir-espaço a tag.
+        // (evita que "head" engula "<header>", por ex.)
+        let boundary = lower[after..]
+            .chars()
+            .next()
+            .map_or(true, |c| c == '>' || c == '/' || c.is_whitespace());
+        if !boundary {
+            out.push_str(&html[pos..after]); // não era a tag; mantém e segue
+            pos = after;
+            continue;
+        }
+        out.push_str(&html[pos..start]); // mantém o texto antes do bloco
+        match lower[after..].find(&close) {
+            Some(crel) => pos = after + crel + close.len(),
+            None => {
+                pos = html.len();
+                break;
+            }
+        }
+    }
+    out.push_str(&html[pos..]);
+    out
+}
+
+/// Tira TODAS as tags de um trecho curto (título/snippet) e decodifica entidades.
+fn html_strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    decode_xml_entities(&out).replace("&nbsp;", " ")
+}
+
+/// Converte uma página HTML em texto legível: remove script/style, troca tags de bloco
+/// por quebras de linha, remove o resto das tags, decodifica entidades e enxuga.
+fn html_to_text(html: &str) -> String {
+    let mut s = html.to_string();
+    for tag in ["script", "style", "noscript", "head", "svg", "template"] {
+        s = strip_html_blocks(&s, tag);
+    }
+    let lower = s.to_ascii_lowercase(); // mesmos offsets de bytes que `s`
+    let mut out = String::with_capacity(s.len() / 2);
+    let mut in_tag = false;
+    let mut tag_start = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                tag_start = i;
+            }
+            '>' => {
+                in_tag = false;
+                let tag = &lower[tag_start..=i];
+                let breaks = tag.starts_with("<br")
+                    || tag.starts_with("</p")
+                    || tag.starts_with("</div")
+                    || tag.starts_with("</h1")
+                    || tag.starts_with("</h2")
+                    || tag.starts_with("</h3")
+                    || tag.starts_with("</h4")
+                    || tag.starts_with("</li")
+                    || tag.starts_with("</tr")
+                    || tag.starts_with("</ul")
+                    || tag.starts_with("</ol")
+                    || tag.starts_with("</title")
+                    || tag.starts_with("</section")
+                    || tag.starts_with("</article")
+                    || tag.starts_with("</header")
+                    || tag.starts_with("</footer");
+                if breaks {
+                    out.push('\n');
+                }
+            }
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = decode_xml_entities(&out).replace("&nbsp;", " ");
+    tidy_lines(&out)
+}
+
+/// Percent-encode para usar numa query string (espaço vira %20).
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Caminho do msedge.exe (procura nas pastas padrão do Windows).
+fn edge_exe_path() -> Option<std::path::PathBuf> {
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        if let Ok(base) = std::env::var(var) {
+            let mut p = std::path::PathBuf::from(base);
+            p.push(r"Microsoft\Edge\Application\msedge.exe");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Abre a URL no Microsoft Edge (janela visível). SEMPRE Edge — nunca o navegador padrão.
+fn open_in_edge(url: &str) -> Result<(), String> {
+    if let Some(exe) = edge_exe_path() {
+        std::process::Command::new(exe)
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("falha ao abrir o Edge: {e}"))
+    } else {
+        // Fallback: protocolo microsoft-edge: (registrado para o Edge no Windows).
+        std::process::Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["/C", "start", "", &format!("microsoft-edge:{url}")])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("falha ao abrir o Edge: {e}"))
+    }
+}
+
+/// Baixa uma URL e devolve o TEXTO legível (HTML vira texto; JSON/txt vêm como estão).
+fn fetch_url_text(http: &ureq::Agent, url: &str) -> Result<String, String> {
+    let resp = http
+        .get(url)
+        .set("User-Agent", WEB_UA)
+        .set("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8")
+        .call();
+    match resp {
+        Ok(r) => {
+            let is_html = r.content_type().contains("html");
+            let body = r.into_string().map_err(|e| format!("resposta inválida: {e}"))?;
+            if is_html || body.trim_start().starts_with('<') {
+                Ok(html_to_text(&body))
+            } else {
+                Ok(body)
+            }
+        }
+        Err(ureq::Error::Status(code, r)) => Err(format!(
+            "HTTP {code}: {}",
+            truncate_str(&r.into_string().unwrap_or_default(), 300)
+        )),
+        Err(e) => Err(format!("rede: {e}")),
+    }
+}
+
+/// O Bing embrulha o link real num redirect `.../ck/a?...&u=a1<base64url>&...`.
+/// Desembrulha para a URL de destino limpa; se não for um link embrulhado, devolve igual.
+fn bing_unwrap_url(url: &str) -> String {
+    if let Some(p) = url.find("u=a1") {
+        let token = url[p + 4..].split('&').next().unwrap_or("");
+        if !token.is_empty() {
+            let dec = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(token)
+                .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(token));
+            if let Ok(bytes) = dec {
+                if let Ok(s) = String::from_utf8(bytes) {
+                    if s.starts_with("http") {
+                        return s;
+                    }
+                }
+            }
+        }
+    }
+    url.to_string()
+}
+
+/// Extrai (título, url, trecho) do HTML de resultados do Bing. Sem regex — varredura manual.
+/// Cada resultado tem `<h2 ...><a ... href="http...">TÍTULO</a>`; o trecho é o 1º <p> seguinte.
+fn parse_bing_results(html: &str, max: usize) -> Vec<(String, String, String)> {
+    let lower = html.to_ascii_lowercase(); // mesmos offsets de bytes que `html`
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut pos = 0usize;
+    while out.len() < max {
+        let Some(h2rel) = lower[pos..].find("<h2") else { break };
+        let h2 = pos + h2rel;
+        let Some(hrel) = lower[h2..].find("href=\"") else {
+            pos = h2 + 3;
+            continue;
+        };
+        let hstart = h2 + hrel + 6;
+        let Some(hend) = html[hstart..].find('"') else { break };
+        let url = bing_unwrap_url(&decode_xml_entities(&html[hstart..hstart + hend]));
+        let after_href = hstart + hend;
+        let Some(gt) = html[after_href..].find('>') else {
+            pos = after_href;
+            continue;
+        };
+        let title_start = after_href + gt + 1;
+        let Some(aclose) = lower[title_start..].find("</a>") else {
+            pos = title_start;
+            continue;
+        };
+        let title = html_strip_tags(&html[title_start..title_start + aclose]).trim().to_string();
+        pos = title_start + aclose + 4; // avança sempre (evita laço infinito)
+        if !url.starts_with("http") || title.is_empty() {
+            continue;
+        }
+        // Trecho: 1º <p>…</p> numa janela curta após o título.
+        let mut snippet = String::new();
+        let window = (pos + 1600).min(html.len());
+        if let Some(prel) = lower[pos..window].find("<p") {
+            let ps = pos + prel;
+            if let Some(pgt) = html[ps..].find('>') {
+                let s0 = ps + pgt + 1;
+                if let Some(pc) = lower[s0..].find("</p>") {
+                    snippet = html_strip_tags(&html[s0..s0 + pc])
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                }
+            }
+        }
+        out.push((title, url, snippet));
+    }
+    out
+}
+
+/// Busca no Bing (buscador padrão do Edge) e devolve os primeiros resultados.
+fn bing_search(
+    http: &ureq::Agent,
+    query: &str,
+    max: usize,
+) -> Result<Vec<(String, String, String)>, String> {
+    let resp = http
+        .get("https://www.bing.com/search")
+        .query("q", query)
+        .set("User-Agent", WEB_UA)
+        .set("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8")
+        .call();
+    let html = match resp {
+        Ok(r) => r.into_string().map_err(|e| format!("resposta inválida: {e}"))?,
+        Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {code}")),
+        Err(e) => return Err(format!("rede: {e}")),
+    };
+    Ok(parse_bing_results(&html, max))
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -1938,6 +2765,104 @@ fn spawn_pick_audio(
     });
 }
 
+/// Extensão (minúscula) de um caminho.
+fn ext_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+fn is_image_ext(path: &str) -> bool {
+    matches!(ext_of(path).as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp")
+}
+
+fn is_audio_ext(path: &str) -> bool {
+    matches!(
+        ext_of(path).as_str(),
+        "mp3" | "wav" | "m4a" | "ogg" | "opus" | "flac" | "aac" | "wma" | "webm" | "mp4" | "mpeg" | "mpga"
+    )
+}
+
+/// Thread: escolhe QUALQUER arquivo e roteia: imagem→visão, áudio→Whisper, documento/texto→conteúdo extraído.
+fn spawn_pick_file(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerMsg>,
+    http: ureq::Agent,
+    groq_key: String,
+    whisper: String,
+) {
+    thread::spawn(move || {
+        let path = match pick_file_path(
+            "Todos os arquivos|*.*|Documentos|*.pdf;*.docx;*.xlsx;*.xls;*.xlsm;*.pptx;*.csv;*.txt;*.json;*.md",
+            "Selecione um arquivo ou documento (qualquer tipo)",
+        ) {
+            Some(p) => p,
+            None => {
+                let _ = tx.send(WorkerMsg::PickCancelled);
+                ctx.request_repaint();
+                return;
+            }
+        };
+        let name = file_name_of(&path);
+        if is_image_ext(&path) {
+            // Imagem → anexo de visão.
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let att = ImageAttachment {
+                        name,
+                        mime: mime_from_ext(&path),
+                        b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    };
+                    let _ = tx.send(WorkerMsg::ImagePicked(att));
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::PickError(format!("Falha ao ler a imagem: {e}")));
+                }
+            }
+        } else if is_audio_ext(&path) {
+            // Áudio/vídeo → transcrição Whisper.
+            match std::fs::read(&path) {
+                Ok(bytes) => match groq_transcribe(&http, &groq_key, &whisper, &name, &bytes) {
+                    Ok(text) if !text.trim().is_empty() => {
+                        let _ = tx.send(WorkerMsg::AudioTranscribed { name, text });
+                    }
+                    Ok(_) => {
+                        let _ = tx.send(WorkerMsg::PickError("A transcrição veio vazia.".into()));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(WorkerMsg::PickError(format!("Falha ao transcrever: {e}")));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(WorkerMsg::PickError(format!("Falha ao ler o áudio: {e}")));
+                }
+            }
+        } else {
+            // Documento (Excel/Word/PDF/PowerPoint) ou texto/código; binário desconhecido vira uma nota.
+            let content = match extract_document(std::path::Path::new(&path)) {
+                Some(Ok(t)) => t,
+                Some(Err(e)) => format!("(não consegui extrair o documento: {e})"),
+                None => match std::fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        format!(
+                            "(arquivo binário \"{name}\" do tipo .{}, {} — sem texto extraível diretamente)",
+                            ext_of(&path),
+                            human_size(size as usize)
+                        )
+                    }
+                },
+            };
+            let content = truncate_str(&content, 60000);
+            let _ = tx.send(WorkerMsg::FilePicked { name, content });
+        }
+        ctx.request_repaint();
+    });
+}
+
 const SKIP_NAMES: &[&str] = &[".git", "target", "updateabyss", "abyss_memory.json", "contexto.md"];
 
 fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
@@ -2084,6 +3009,7 @@ fn run_agent_loop(
     http: &ureq::Agent,
     gemini_key: &str,
     groq_key: &str,
+    openrouter_key: &str,
     models: &[String],
     system: &str,
     history: &mut Vec<(String, String)>,
@@ -2097,7 +3023,7 @@ fn run_agent_loop(
 
         // Chamada resiliente: troca de modelo em silêncio em caso de limite/cota,
         // avisa "recarregando" e tenta de novo a cada 60s. Nunca para por erro de API.
-        let raw = call_resilient(http, gemini_key, groq_key, models, system, history, img, true, tx, ctx);
+        let raw = call_resilient(http, gemini_key, groq_key, openrouter_key, models, system, history, img, true, tx, ctx);
         history.push(("model".into(), raw.clone()));
 
         let parsed: serde_json::Value = serde_json::from_str(&raw)
@@ -2107,6 +3033,8 @@ fn run_agent_loop(
         let path = parsed.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let content = parsed.get("content").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let ps = parsed.get("powershell").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let url = parsed.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let query = parsed.get("query").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let done = parsed.get("task_complete").and_then(|x| x.as_bool()).unwrap_or(false);
 
         if !expl.trim().is_empty() {
@@ -2163,6 +3091,90 @@ fn run_agent_loop(
                 ctx.request_repaint();
                 history.push(("user".into(), format!("Saída do comando:\n{output}\n\nPróximo passo ou finalize.")));
             }
+            "web_search" if !query.trim().is_empty() => {
+                acted = true;
+                let _ = tx.send(WorkerMsg::AgentCmd(format!("🔎 web_search (Edge · Bing): {query}")));
+                ctx.request_repaint();
+                // Abre os resultados no Edge (o usuário vê) e extrai a lista para a IA usar.
+                let bing_url = format!("https://www.bing.com/search?q={}", url_encode(&query));
+                let _ = open_in_edge(&bing_url);
+                match bing_search(http, &query, 6) {
+                    Ok(results) if !results.is_empty() => {
+                        let mut txt = String::new();
+                        for (i, (t, u, s)) in results.iter().enumerate() {
+                            txt.push_str(&format!("{}. {}\n   {}\n", i + 1, t, u));
+                            if !s.trim().is_empty() {
+                                txt.push_str(&format!("   {}\n", truncate_str(s, 300)));
+                            }
+                        }
+                        let _ = tx.send(WorkerMsg::AgentOut(truncate_str(&txt, 2500)));
+                        ctx.request_repaint();
+                        history.push(("user".into(), format!(
+                            "Resultados da busca por \"{query}\" (Bing, já aberta no Edge):\n{}\n\nSe precisar do conteúdo de algum, use read_url/open_url no link. Próximo passo ou finalize.",
+                            truncate_str(&txt, 6000)
+                        )));
+                    }
+                    Ok(_) => {
+                        let _ = tx.send(WorkerMsg::AgentOut("Busca aberta no Edge, mas não extraí resultados em texto.".into()));
+                        ctx.request_repaint();
+                        history.push(("user".into(), format!("A busca por \"{query}\" foi aberta no Edge, mas não consegui extrair os resultados em texto. Tente outra busca ou um open_url direto. Próximo passo ou finalize.")));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(WorkerMsg::AgentOut(format!("Busca falhou ({e}); abri o Bing no Edge mesmo assim.")));
+                        ctx.request_repaint();
+                        history.push(("user".into(), format!("A busca por \"{query}\" falhou ({e}); mas abri o Bing no Edge. Próximo passo ou finalize.")));
+                    }
+                }
+            }
+            "open_url" if !url.trim().is_empty() => {
+                acted = true;
+                let _ = tx.send(WorkerMsg::AgentCmd(format!("🌐 open_url (Edge): {url}")));
+                ctx.request_repaint();
+                let opened = open_in_edge(&url);
+                match (opened, fetch_url_text(http, &url)) {
+                    (_, Ok(text)) => {
+                        let _ = tx.send(WorkerMsg::AgentOut(format!(
+                            "Aberto no Edge. Conteúdo (início):\n{}",
+                            truncate_str(&text, 2000)
+                        )));
+                        ctx.request_repaint();
+                        history.push(("user".into(), format!(
+                            "Abri {url} no Microsoft Edge (o usuário está vendo). Texto da página:\n{}\n\nResponda/aja com base nisso. Próximo passo ou finalize.",
+                            truncate_str(&text, 30000)
+                        )));
+                    }
+                    (Ok(()), Err(e)) => {
+                        let _ = tx.send(WorkerMsg::AgentOut(format!("Aberto no Edge, mas não li o conteúdo: {e}")));
+                        ctx.request_repaint();
+                        history.push(("user".into(), format!("Abri {url} no Edge (visível ao usuário), mas a leitura do HTML falhou: {e}. Próximo passo ou finalize.")));
+                    }
+                    (Err(e), Err(e2)) => {
+                        let _ = tx.send(WorkerMsg::AgentOut(format!("Falhou ao abrir no Edge ({e}) e ao ler ({e2}).")));
+                        ctx.request_repaint();
+                        history.push(("user".into(), format!("Não consegui abrir {url} no Edge ({e}) nem ler o conteúdo ({e2}). Próximo passo ou finalize.")));
+                    }
+                }
+            }
+            "read_url" if !url.trim().is_empty() => {
+                acted = true;
+                let _ = tx.send(WorkerMsg::AgentCmd(format!("📰 read_url: {url}")));
+                ctx.request_repaint();
+                match fetch_url_text(http, &url) {
+                    Ok(text) => {
+                        let _ = tx.send(WorkerMsg::AgentOut(truncate_str(&text, 2000)));
+                        ctx.request_repaint();
+                        history.push(("user".into(), format!(
+                            "Texto de {url}:\n{}\n\nPróximo passo ou finalize.",
+                            truncate_str(&text, 30000)
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(WorkerMsg::AgentOut(format!("Não consegui ler {url}: {e}")));
+                        ctx.request_repaint();
+                        history.push(("user".into(), format!("Falha ao ler {url}: {e}. Tente open_url (abre no Edge) ou outro link. Próximo passo ou finalize.")));
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -2179,6 +3191,7 @@ fn spawn_agent(
     http: ureq::Agent,
     gemini_key: String,
     groq_key: String,
+    openrouter_key: String,
     models: Vec<String>,
     system: String,
     mut history: Vec<(String, String)>,
@@ -2189,7 +3202,7 @@ fn spawn_agent(
     thread::spawn(move || {
         let mut wd = work_dir;
         run_agent_loop(
-            &ctx, &tx, &http, &gemini_key, &groq_key, &models, &system, &mut history, &mut wd,
+            &ctx, &tx, &http, &gemini_key, &groq_key, &openrouter_key, &models, &system, &mut history, &mut wd,
             auto_run, MAX_AGENT_STEPS, image,
         );
         // Persiste a pasta atual (caso o agente tenha feito change_dir) para a próxima mensagem.
@@ -2208,6 +3221,7 @@ fn spawn_self_update(
     http: ureq::Agent,
     key: String,
     groq_key: String,
+    openrouter_key: String,
     models: Vec<String>,
     memory_block: String,
     instruction: String,
@@ -2277,7 +3291,7 @@ fn spawn_self_update(
         let mut history: Vec<(String, String)> = vec![("user".to_string(), seed)];
         let mut wd = update_dir.clone();
         run_agent_loop(
-            &ctx, &tx, &http, &key, &groq_key, &models, &system, &mut history, &mut wd, true, 24, None,
+            &ctx, &tx, &http, &key, &groq_key, &openrouter_key, &models, &system, &mut history, &mut wd, true, 24, None,
         );
 
         say("🛠 Compilando a cópia (cargo build)… na 1ª vez pode levar alguns minutos.".into());
@@ -2356,9 +3370,10 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        context_entry, decode_xml_entities, detect_memory_command, fmt_utc, is_groq, ordered_models,
-        parse_segments, resolve_path, should_inject_context, switch_preamble, truncate_str,
-        truncate_tail, vision_models, xml_to_text, Segment,
+        context_entry, decode_xml_entities, detect_memory_command, fmt_utc, html_to_text,
+        bing_unwrap_url, is_chat_capable, is_groq, is_openrouter, ordered_models, parse_bing_results,
+        parse_segments, resolve_path, should_inject_context, strip_html_blocks, switch_preamble,
+        truncate_str, truncate_tail, url_encode, vision_models, xml_to_text, Segment,
     };
     use std::path::Path;
 
@@ -2422,6 +3437,214 @@ mod tests {
         assert!(is_groq("openai/gpt-oss-120b"));
         assert!(!is_groq("gemini-2.5-flash"));
         assert!(!is_groq("gemini-1.5-pro"));
+    }
+
+    #[test]
+    fn openrouter_detectado_e_nao_confunde_com_groq() {
+        assert!(is_openrouter("meta-llama/llama-3-8b-instruct:free"));
+        assert!(is_openrouter("mistralai/mistral-7b-instruct:free"));
+        assert!(is_openrouter("google/gemma-7b-it:free"));
+        // ids ":free" são do OpenRouter, NÃO da Groq (mesmo contendo '/')
+        assert!(!is_groq("meta-llama/llama-3-8b-instruct:free"));
+        assert!(!is_groq("google/gemma-7b-it:free"));
+        assert!(is_chat_capable("undi95/toppy-m-7b:free"));
+    }
+
+    #[test]
+    fn openrouter_selecionado_vem_primeiro_e_cai_para_outros() {
+        let v = ordered_models("mistralai/mistral-7b-instruct:free");
+        assert_eq!(v[0], "mistralai/mistral-7b-instruct:free");
+        // fallback cruza para Groq e Gemini também
+        assert!(v.iter().any(|m| m == "llama-3.3-70b-versatile"));
+        assert!(v.iter().any(|m| m == "gemini-2.5-flash"));
+        // sem duplicar o selecionado
+        assert_eq!(
+            v.iter().filter(|m| *m == "mistralai/mistral-7b-instruct:free").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn openrouter_entra_no_fallback_de_gemini_e_groq() {
+        assert!(ordered_models("gemini-2.5-flash").iter().any(|m| m.ends_with(":free")));
+        assert!(ordered_models("llama-3.1-8b-instant").iter().any(|m| m.ends_with(":free")));
+    }
+
+    #[test]
+    fn url_encode_escapa_query() {
+        assert_eq!(url_encode("rust lang"), "rust%20lang");
+        assert_eq!(url_encode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(url_encode("café"), "caf%C3%A9"); // multibyte → %XX por byte
+    }
+
+    #[test]
+    fn strip_blocks_nao_engole_tag_parecida() {
+        // "head" NÃO pode casar com "<header>"
+        let s = "<head><title>x</title></head><header>OI</header><p>fim</p>";
+        let r = strip_html_blocks(s, "head");
+        assert!(!r.contains("<title>"), "deveria remover o <head>");
+        assert!(r.contains("<header>OI</header>"), "não pode engolir <header>");
+        assert!(r.contains("fim"));
+    }
+
+    #[test]
+    fn html_to_text_remove_script_e_style() {
+        let h = "<html><head><title>T</title><style>.x{color:red}</style></head>\
+                 <body><script>var a=1;alert('x')</script><h1>Olá</h1><p>mundo &amp; cia</p></body></html>";
+        let t = html_to_text(h);
+        assert!(t.contains("Olá"), "perdeu o texto visível");
+        assert!(t.contains("mundo & cia"), "não decodificou/perdeu o parágrafo");
+        assert!(!t.contains("var a=1"), "não removeu o <script>");
+        assert!(!t.contains("color:red"), "não removeu o <style>");
+    }
+
+    #[test]
+    fn parse_bing_extrai_titulo_url_e_trecho() {
+        let html = "<li class=\"b_algo\"><h2><a href=\"https://rust-lang.org/\" h=\"ID\">Rust <strong>Lang</strong></a></h2>\
+                    <div class=\"b_caption\"><p>A linguagem Rust.</p></div></li>\
+                    <li class=\"b_algo\"><h2><a href=\"https://doc.rust-lang.org/\">Docs</a></h2>\
+                    <p class=\"b_lineclamp2\">Documentação oficial.</p></li>";
+        let r = parse_bing_results(html, 6);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0, "Rust Lang");
+        assert_eq!(r[0].1, "https://rust-lang.org/");
+        assert_eq!(r[0].2, "A linguagem Rust.");
+        assert_eq!(r[1].0, "Docs");
+        assert_eq!(r[1].1, "https://doc.rust-lang.org/");
+        assert!(r[1].2.contains("Documentação"));
+    }
+
+    #[test]
+    #[ignore = "rede + abre o Edge de verdade; rode com: cargo test web_integration_real -- --ignored"]
+    fn web_integration_real() {
+        use std::time::Duration;
+        let connector = native_tls::TlsConnector::new().unwrap();
+        let http = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(20))
+            .timeout_read(Duration::from_secs(60))
+            .tls_connector(std::sync::Arc::new(connector))
+            .build();
+        // 1) fetch de página real → texto legível
+        let page = super::fetch_url_text(&http, "https://example.com").unwrap();
+        assert!(page.contains("Example Domain"), "texto da página: {page}");
+        // 2) busca no Bing real → resultados com URL http
+        let res = super::bing_search(&http, "rust lang site oficial", 5).unwrap();
+        assert!(!res.is_empty(), "Bing não retornou resultados");
+        assert!(res.iter().all(|(_, u, _)| u.starts_with("http")));
+        eprintln!("Bing top: {} -> {}", res[0].0, res[0].1);
+        // 3) Edge existe e abre de verdade
+        assert!(super::edge_exe_path().is_some(), "msedge.exe não encontrado");
+        super::open_in_edge("https://example.com").unwrap();
+    }
+
+    #[test]
+    #[ignore = "rede: chamada real ao modelo (usa o AGENT_SYSTEM + schema reais); rode com --ignored"]
+    fn agente_decide_open_url_real() {
+        use std::time::Duration;
+        let connector = native_tls::TlsConnector::new().unwrap();
+        let http = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(20))
+            .timeout_read(Duration::from_secs(90))
+            .tls_connector(std::sync::Arc::new(connector))
+            .build();
+        let history = vec![(
+            "user".to_string(),
+            "acesse https://example.com e me diga qual é o título da página".to_string(),
+        )];
+        // tenta alguns provedores até um responder (cota/limite varia)
+        let models = ["gemini-2.5-flash", "llama-3.3-70b-versatile", "openai/gpt-oss-20b:free"];
+        let mut got: Option<String> = None;
+        for m in models {
+            match super::call_one(
+                &http,
+                super::DEFAULT_API_KEY,
+                super::DEFAULT_GROQ_KEY,
+                super::DEFAULT_OPENROUTER_KEY,
+                m,
+                super::AGENT_SYSTEM,
+                &history,
+                None,
+                true,
+            ) {
+                Ok(raw) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+                    let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    eprintln!("modelo {m} → action={action}  url={:?}", v.get("url"));
+                    got = Some(action);
+                    break;
+                }
+                Err(e) => eprintln!("modelo {m} falhou: {e}"),
+            }
+        }
+        let action = got.expect("nenhum modelo respondeu");
+        assert!(
+            action == "open_url" || action == "read_url",
+            "esperava open_url/read_url para 'acesse ...', veio: {action}"
+        );
+    }
+
+    #[test]
+    fn parse_bing_respeita_o_limite_e_ignora_sem_http() {
+        let html = "<h2><a href=\"/local/rel\">rel</a></h2>\
+                    <h2><a href=\"https://a.com\">A</a></h2>\
+                    <h2><a href=\"https://b.com\">B</a></h2>";
+        let r = parse_bing_results(html, 1);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].1, "https://a.com"); // pulou o href relativo (sem http)
+    }
+
+    #[test]
+    fn bing_unwrap_decodifica_redirect() {
+        // token base64url real capturado do Bing → https://rust-lang.org/
+        let wrapped = "https://www.bing.com/ck/a?!&&p=9437&ptn=3&u=a1aHR0cHM6Ly9ydXN0LWxhbmcub3JnLw&ntb=1";
+        assert_eq!(bing_unwrap_url(wrapped), "https://rust-lang.org/");
+        // URL direta (sem redirect) passa intacta
+        assert_eq!(bing_unwrap_url("https://rust-lang.org/"), "https://rust-lang.org/");
+    }
+
+    #[test]
+    fn parse_bing_desembrulha_link_do_resultado() {
+        // href embrulhado com entidades &amp; (como vem no HTML real do Bing)
+        let html = "<h2><a href=\"https://www.bing.com/ck/a?!&amp;&amp;u=a1aHR0cHM6Ly9ydXN0LWxhbmcub3JnLw&amp;ntb=1\">Rust</a></h2>";
+        let r = parse_bing_results(html, 5);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].1, "https://rust-lang.org/");
+    }
+
+    #[test]
+    fn tier_list_cobre_todos_os_modelos_de_chat() {
+        use std::collections::HashSet;
+        // União dos 4 tiers de exibição.
+        let mut tier: Vec<&str> = Vec::new();
+        for arr in [super::TIER_TOP, super::TIER_STRONG, super::TIER_BALANCED, super::TIER_FAST] {
+            tier.extend_from_slice(arr);
+        }
+        let tier_set: HashSet<&str> = tier.iter().copied().collect();
+        // 1) Nenhum modelo aparece em mais de um tier.
+        assert_eq!(tier_set.len(), tier.len(), "modelo repetido entre tiers");
+        // 2) Todo item do tier é um modelo de CHAT de verdade.
+        for &m in &tier {
+            assert!(is_chat_capable(m), "{m} não é chat-capaz");
+        }
+        // 3) A tier list = exatamente o catálogo de modelos de chat (sem sobra/falta).
+        let mut catalog: Vec<&str> = Vec::new();
+        for arr in [
+            super::FLASH_MODELS,
+            super::PRO_MODELS,
+            super::GROQ_CHAT_MODELS,
+            super::GROQ_VISION_MODELS,
+            super::OPENROUTER_CHAT_MODELS,
+        ] {
+            catalog.extend_from_slice(arr);
+        }
+        let catalog_set: HashSet<&str> = catalog.iter().copied().collect();
+        for &m in &catalog_set {
+            assert!(tier_set.contains(m), "modelo de chat fora da tier list: {m}");
+        }
+        for &m in &tier_set {
+            assert!(catalog_set.contains(m), "tier list tem id fora do catálogo: {m}");
+        }
     }
 
     #[test]
@@ -2489,6 +3712,15 @@ mod tests {
             decode_xml_entities("a &amp; b &lt;c&gt; &quot;d&quot;"),
             "a & b <c> \"d\""
         );
+    }
+
+    #[test]
+    fn classifica_extensoes_de_anexo() {
+        assert!(super::is_image_ext("foto.PNG"));
+        assert!(super::is_audio_ext("musica.mp3"));
+        assert!(!super::is_image_ext("planilha.xlsx"));
+        assert!(!super::is_audio_ext("relatorio.docx"));
+        assert_eq!(super::ext_of("a/b/c.PDF"), "pdf");
     }
 
     #[test]
