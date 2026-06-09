@@ -608,6 +608,15 @@ enum WorkerMsg {
     PickError(String),
     /// O usuário cancelou o seletor de arquivos.
     PickCancelled,
+    /// Tarefa avulsa (ex.: git push/pull) terminou: libera o "pending" SEM mexer no histórico.
+    Done,
+}
+
+/// Operação de Git acionada pelos botões do painel de Configurações.
+#[derive(Clone, Copy)]
+enum GitOp {
+    Push,
+    Pull,
 }
 
 #[derive(Clone)]
@@ -743,27 +752,39 @@ impl App {
 
                 ui.add_space(2.0);
                 ui.separator();
-                section_label(ui, "🔄 Auto-update");
+                section_label(ui, "🔁 Git (Push / Pull)");
                 ui.label(
                     egui::RichText::new(
-                        "O Abyss edita o próprio código, compila e promove a nova versão se passar. \
-                         Escreva no campo de mensagem o QUE mudar e clique no botão.",
+                        "Push: envia suas mudanças para o Git (GitHub). \
+                         Pull: traz as atualizações do Git para o seu PC.",
                     )
                     .small()
                     .color(theme::TEXT_MUTED),
                 );
-                if ui
-                    .add_enabled(
-                        !self.pending,
-                        egui::Button::new(
-                            egui::RichText::new("🔄 Atualizar o Abyss AI").color(theme::TEXT_MAIN),
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.pending,
+                            egui::Button::new(egui::RichText::new("⬆ Push").color(theme::TEXT_MAIN))
+                                .fill(theme::ACCENT),
                         )
-                        .fill(theme::ACCENT),
-                    )
-                    .clicked()
-                {
-                    self.start_self_update(ctx);
-                }
+                        .on_hover_text("git: salva tudo (add + commit) e envia para o GitHub")
+                        .clicked()
+                    {
+                        self.start_git(ctx, GitOp::Push);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.pending,
+                            egui::Button::new(egui::RichText::new("⬇ Pull").color(theme::TEXT_MAIN))
+                                .fill(theme::SURFACE_HOVER),
+                        )
+                        .on_hover_text("git pull: traz as atualizações do GitHub para cá")
+                        .clicked()
+                    {
+                        self.start_git(ctx, GitOp::Pull);
+                    }
+                });
 
                 ui.add_space(2.0);
                 ui.separator();
@@ -1019,6 +1040,24 @@ impl App {
         spawn_agent(ctx2, tx, http, gkey, qkey, okey, models, system, history, work_dir, auto, image);
     }
 
+    /// Dispara um `git push` (salva tudo e envia) ou `git pull` (traz do Git) em
+    /// segundo plano, mostrando a saída no chat. Não trava a UI.
+    fn start_git(&mut self, ctx: &egui::Context, op: GitOp) {
+        if self.pending {
+            return;
+        }
+        let titulo = match op {
+            GitOp::Push => "⬆ Git Push — salvando e enviando para o GitHub…",
+            GitOp::Pull => "⬇ Git Pull — trazendo do GitHub…",
+        };
+        self.convo
+            .transcript
+            .push(Msg::new(Role::User, titulo.to_string()));
+        self.pending = true;
+        spawn_git(ctx.clone(), self.tx.clone(), op, self.project_root.clone());
+    }
+
+    #[allow(dead_code)] // mantido para reativar o Auto-update depois (desligado da UI por enquanto)
     fn start_self_update(&mut self, ctx: &egui::Context) {
         if self.pending {
             return;
@@ -1085,6 +1124,10 @@ impl App {
                 }
                 WorkerMsg::AgentDone(h) => {
                     self.convo.history = h;
+                    self.pending = false;
+                    self.status = None;
+                }
+                WorkerMsg::Done => {
                     self.pending = false;
                     self.status = None;
                 }
@@ -1442,21 +1485,34 @@ impl eframe::App for App {
                                     if can_send && send.hovered() {
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     }
-                                    let send = send.on_hover_text("Enviar (Enter)");
+                                    let send = send.on_hover_text("Enviar (Enter · Shift+Enter = nova linha)");
                                     ui.add_space(4.0);
-                                    let resp = ui.add_sized(
-                                        [ui.available_width(), 26.0],
-                                        egui::TextEdit::singleline(&mut self.input)
-                                            .frame(false)
-                                            .hint_text("Pergunte, mande fazer algo, ou anexe pelo  +"),
-                                    );
+                                    // Campo MULTILINHA: cresce de 1 até ~6 linhas conforme o texto
+                                    // e, passando disso, rola por dentro (não empurra o resto da tela).
+                                    let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                                    let resp = egui::ScrollArea::vertical()
+                                        .id_source("input_scroll")
+                                        .max_height(row_h * 6.0 + 8.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut self.input)
+                                                    .frame(false)
+                                                    .desired_rows(1)
+                                                    .desired_width(f32::INFINITY)
+                                                    .hint_text("Pergunte, mande fazer algo, ou anexe pelo  +   ·   Shift+Enter = nova linha"),
+                                            )
+                                        })
+                                        .inner;
                                     (resp, can_send && send.clicked())
                                 })
                                 .inner;
 
-                            // Enter envia (mantendo o foco para continuar digitando).
-                            let enter_send =
-                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            // Enter (sem Shift) envia; Shift+Enter quebra linha (campo multilinha).
+                            // O '\n' que o Enter chega a inserir é descartado no send() (trim + clear).
+                            // Mantém o foco para continuar digitando.
+                            let enter_send = resp.has_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                             if (send_clicked || enter_send) && !self.pending {
                                 do_send = true;
                                 resp.request_focus();
@@ -2953,8 +3009,45 @@ fn spawn_pick_file(
     });
 }
 
+/// Roda `git push` (salva tudo: add + commit se houver mudança + push) ou `git pull`
+/// na raiz do projeto, em segundo plano, e transmite a saída para o chat (sem travar a UI).
+fn spawn_git(
+    ctx: egui::Context,
+    tx: mpsc::Sender<WorkerMsg>,
+    op: GitOp,
+    project_root: std::path::PathBuf,
+) {
+    thread::spawn(move || {
+        let (rotulo, script) = match op {
+            GitOp::Push => (
+                "git push",
+                // `2>&1 | Out-String`: o git escreve progresso no stderr; isso o traz como
+                // texto normal (sem aparecer como "erro"). Commit só se houver o que commitar.
+                "git add -A 2>&1 | Out-String; \
+                 if (git status --porcelain) { \
+                     git commit -m ('Atualizacao pelo Abyss ' + (Get-Date -Format 'yyyy-MM-dd HH:mm')) 2>&1 | Out-String \
+                 } else { 'Nada novo para commitar.' }; \
+                 git push 2>&1 | Out-String",
+            ),
+            GitOp::Pull => ("git pull", "git pull 2>&1 | Out-String"),
+        };
+        let _ = tx.send(WorkerMsg::AgentCmd(format!(
+            "▶ {rotulo}  (em {})",
+            project_root.display()
+        )));
+        ctx.request_repaint();
+        let out = run_powershell(script, &project_root);
+        let _ = tx.send(WorkerMsg::AgentOut(out));
+        ctx.request_repaint();
+        let _ = tx.send(WorkerMsg::Done);
+        ctx.request_repaint();
+    });
+}
+
+#[allow(dead_code)] // usado pelo Auto-update (desligado da UI por enquanto)
 const SKIP_NAMES: &[&str] = &[".git", "target", "updateabyss", "abyss_memory.json", "contexto.md"];
 
+#[allow(dead_code)] // idem (Auto-update)
 fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -2977,6 +3070,7 @@ fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()
     Ok(())
 }
 
+#[allow(dead_code)] // idem (Auto-update)
 fn promote_tree(src: &std::path::Path, dst: &std::path::Path, count: &mut usize) -> std::io::Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -3327,6 +3421,7 @@ fn spawn_agent(
 
 /// Auto-edição do próprio Abyss: push → cópia `updateabyss` → o agente edita →
 /// `cargo build` → promove se compilar; se não, mantém a cópia para iterar depois.
+#[allow(dead_code)] // Auto-update desligado da UI por enquanto (substituído pelos botões Push/Pull)
 #[allow(clippy::too_many_arguments)]
 fn spawn_self_update(
     ctx: egui::Context,
